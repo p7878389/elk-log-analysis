@@ -6,9 +6,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import envfile  # noqa: E402
+
+envfile.apply_from_argv()  # 服务端原生部署：elk.py --env-file deploy/.env repo-sync
 import code_core as code  # noqa: E402
 import diag  # noqa: E402
 import elk_core as core  # noqa: E402
+import repo_sync  # noqa: E402
 
 
 def add_filters(p):
@@ -102,6 +106,19 @@ def run(args):
                 % (", ".join(refs) or "（无）",
                    "" if args.keep_globals else "，以及已写进每个环境的全局 ELK_<KEY>",
                    core.CONFIG_PATH.replace(os.path.expanduser("~"), "~", 1), doc))
+    if args.cmd == "repo-sync":
+        scfg = repo_sync.load_sync_config()
+        if args.status or scfg is None:
+            return repo_sync.describe(scfg)
+        if args.no_index:
+            scfg["index_envs"] = []
+        if args.dry_run:
+            ps = repo_sync.plan_dirs(scfg, repo_sync.list_projects(scfg), repo_sync._load_manifest(scfg))
+            rows = ["%s %-50s → %s" % ("·" if os.path.exists(os.path.join(scfg["dir"], p["dir"])) else "+",
+                                        p["path_with_namespace"], p["dir"]) for p in ps]
+            return "\n".join(rows + ["共 %d 个项目（+ 将新 clone，· 已存在将 fetch），目录 %s" % (len(ps), scfg["dir"])])
+        repo_sync.run_sync(scfg, progress=lambda m: print(m, file=sys.stderr, flush=True))
+        return repo_sync.describe(scfg)
     if args.cmd == "doctor":  # 配置坏了也要能诊断：在 load_config 之前处理
         if not args.no_mcp_env:
             diag.apply_mcp_env()
@@ -205,6 +222,11 @@ def main():
     p = sub.add_parser("code-prepare", help="准备只读 worktree 与 GitNexus 索引")
     p.add_argument("--no-index", action="store_true", help="不触发索引构建")
     add_code_target(p)
+
+    p = sub.add_parser("repo-sync", help="从 GitLab 同步有权限的仓库（ELK_GITLAB_URL / ELK_GITLAB_TOKEN）")
+    p.add_argument("--status", action="store_true", help="只查看同步状态与已同步仓库")
+    p.add_argument("--dry-run", action="store_true", help="只列出将同步的项目与本地目录")
+    p.add_argument("--no-index", action="store_true", help="本次不预建 GitNexus 索引")
 
     args = ap.parse_args()
     try:

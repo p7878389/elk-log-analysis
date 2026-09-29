@@ -18,6 +18,7 @@
 | `elk_search` / `elk_trace` | 检索日志明细；按 traceId 串联全链路 |
 | `elk_query_dsl` | 自定义 Query DSL，只允许 `_search` / `_count` |
 | `code_services` / `code_locate` / `code_prepare` | 从 pod 识别服务；把堆栈定位到部署版本的源码；准备只读 worktree 和 GitNexus 索引 |
+| `code_repos` | GitLab 仓库同步状态；管理员可手动触发同步 |
 | `elk_doctor` | 自检：配置、凭据、连通性、依赖、缓存和调用日志 |
 
 几条安全约束：
@@ -62,6 +63,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 | 命令 | `./install.sh --mode remote --url https://<服务地址>/mcp` | `./install.sh --mode local --code-root ~/code` |
 | 生产权限 | 由管理员按人控制 | 取决于你自己的 ELK 账号 |
 
+如果服务端开启了 GitNexus，远程模式会一并注册 `gitnexus-remote`，用来直接查询服务端预建的调用链和影响面索引，本机不需要 clone 任何代码。
+
 远程模式在**写入任何配置之前**会先验证 token，token 无效时直接退出，不做任何改动。本地模式会从模板生成 `~/.config/elk-log-analysis/envs.json`，并提示凭据的存放方式：macOS 放钥匙串，Windows 和 Linux 放环境变量。配置项说明见 [references/mcp-config.md](references/mcp-config.md)。
 
 ### 常用选项
@@ -84,7 +87,9 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 ## 部署远程服务
 
-提供 Docker Compose（可选 Caddy 自动 HTTPS），以及 Linux systemd、macOS launchd、Windows 计划任务的原生部署方式。每个成员一个 token，可以按人控制生产环境权限。详见 [deploy/README.md](deploy/README.md)。
+提供 Docker Compose（可选 Caddy 自动 HTTPS），以及 Linux systemd、macOS launchd、Windows 计划任务的原生部署方式。每个成员一个 token，可以按人控制生产权限和源码权限。
+
+服务端可以**定时从 GitLab 同步仓库**（自建实例也支持）：自动列出令牌有权限的项目，用部分 clone 拉取，并可预建 GitNexus 索引。生产出问题时，代码已经在服务器上准备好了，谁都不用临时去 clone。详见 [deploy/README.md](deploy/README.md)。
 
 ## 文档
 

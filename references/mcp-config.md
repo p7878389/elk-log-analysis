@@ -199,3 +199,7 @@ git -C ~/code/<仓库> worktree remove --force ~/.cache/elk-log-analysis/worktre
 security add-generic-password -U -s elk-log-analysis -a prod -w
 ```
 然后在 elk 对象（或 envs.json）的环境项中写 `"password": "keychain:elk-log-analysis/prod"`；MCP env 写法则为 `ELK_PASSWORD=keychain:elk-log-analysis/default`（全局）或 `ELK_PROD_PASSWORD=keychain:elk-log-analysis/prod`（只给生产单独配）。
+
+## GitLab 仓库同步（服务端）
+
+团队部署时，可以让服务端定时从 GitLab 同步仓库，代替手动 clone 到 `ELK_CODE_ROOT`。相关变量是 `ELK_GITLAB_URL`、`ELK_GITLAB_TOKEN`、`ELK_GITLAB_GROUPS`、`ELK_REPO_SYNC_*`，说明见 `scripts/repo_sync.py` 文件开头和 `deploy/README.md` 第 4 节。同步目录会自动加入代码目录扫描，不用另外改 `ELK_CODE_ROOT`。

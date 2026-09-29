@@ -1,6 +1,7 @@
 # 构建上下文为 skill 根目录：docker compose -f deploy/docker-compose.yml build
 # target=base：只提供 elk_* 日志查询（约 150MB）
-# target=code：额外带 node + gitnexus，支持 code_* 源码定位与索引
+# target=code：额外带 node + gitnexus，支持 code_* 源码定位、GitLab 仓库同步后的索引预建，
+#              并在 /gitnexus/mcp 向成员提供服务端的 GitNexus 查询
 FROM python:3.12-slim-bookworm AS base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git openssh-client ca-certificates tzdata \
@@ -35,5 +36,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && npm cache clean --force && rm -rf /root/.cache/node-gyp \
  && apt-get purge -y --auto-remove build-essential && rm -rf /var/lib/apt/lists/*
 ENV ELK_CODE_ROOT=/repos \
-    ELK_CODE_GITNEXUS=/usr/local/bin/gitnexus
+    ELK_CODE_GITNEXUS=/usr/local/bin/gitnexus \
+    GITNEXUS_HOME=/data/gitnexus \
+    ELK_GITNEXUS_MCP=1
 USER elk

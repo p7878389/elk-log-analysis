@@ -24,10 +24,10 @@ docker compose up -d --build
 curl http://127.0.0.1:8765/healthz                # 返回 ok
 ```
 
-- **文件权限**：容器以 uid 10001 运行，`config/` 下的文件必须让它可读，执行 `chmod 644 config/*.json`（这两个文件不含密码，密码在 `.env` 中，`.env` 只由宿主机上的 compose 读取，保持 600 即可）。
+- **文件权限**：容器以 uid 10001 运行，`config/` 下的文件必须让它可读。推荐执行 `sudo chown 10001:10001 config/*.json && chmod 600 config/*.json`，也就是只有容器用户可读。用 `chmod 644` 也能运行，但日志里会有权限提示；这两个文件本身不含密码。密码放在 `.env` 里，`.env` 只由宿主机上的 compose 读取，保持 600 即可。
 - **HTTPS**：服务器有公网域名时，在 `.env` 中设置 `ELK_DOMAIN`，然后运行 `docker compose --profile tls up -d --build`，Caddy 会自动申请证书。纯内网的做法见 `Caddyfile` 中的注释，也可以用 `ELK_HTTP_CERT`/`ELK_HTTP_KEY` 由服务直接提供 HTTPS。
 - **不走代理、内网直连**：把 `.env` 中的 `ELK_HTTP_PUBLISH` 设为 `8765`，即监听所有网卡。
-- **需要 `code_*` 源码定位**：用 `ELK_IMAGE_TARGET=code docker compose up -d --build`，并在 `docker-compose.yml` 中打开 `/repos` 和 SSH key 的挂载。服务器上的仓库要能执行 `git fetch`（用只读的 deploy key 即可）。
+- **需要源码定位和调用链分析**：用 `ELK_IMAGE_TARGET=code docker compose up -d --build`，并配置 GitLab 仓库同步，见[第 4 节](#4-gitlab-仓库同步与服务端-gitnexus)。
 
 ### 方式二：原生运行（不用 Docker）
 
@@ -57,7 +57,8 @@ python3 scripts/mcp_http.py gen-token alice
 | 字段 | 含义 |
 |---|---|
 | `prod: true` | 允许查生产。没有此权限时查询生产会被明确拒绝，`code_*` 退回到分支最新提交 |
-| `admin: true` | 允许执行 `elk_doctor fix=true`，否则只能诊断 |
+| `admin: true` | 允许执行 `elk_doctor fix=true`、手动触发仓库同步（`code_repos sync=true`），否则只能查看 |
+| `code: false` | 禁止查看源码：`code_*` 和 `/gitnexus/mcp` 都会被拒绝（默认允许） |
 | `disabled: true` | 临时停用该成员，删除该行则永久移除 |
 
 修改 `tokens.json` 后自动生效。Docker 部署挂载的是整个目录，编辑器替换文件也能被感知。
@@ -122,14 +123,69 @@ bearer_token_env_var = "ELK_MCP_TOKEN"
 
 `Authorization:${AUTH}` 冒号两边不要留空格，否则 Windows 上参数会被拆开。
 
-## 4. 安全要点
+## 4. GitLab 仓库同步与服务端 GitNexus
+
+服务端可以定时从 GitLab（包括自建实例）同步仓库，让 `code_*` 随时有代码可用。成员通过 `gitnexus-remote` 直接查询服务端预建的调用链索引，**成员电脑上不需要 clone 任何仓库**。
+
+```
+GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch 到 /repos ──▶ code_locate / code_services
+                                          └─(可选) 预建 prod 分支 GitNexus 索引 ──▶ /gitnexus/mcp ──▶ 成员的 gitnexus-remote
+```
+
+### 配置
+
+1. **准备访问令牌**：在 GitLab 中创建令牌，权限选 `read_api` + `read_repository`。
+2. **填写 `.env`**（完整选项见 `.env.example` 的「GitLab 仓库定时同步」段）：
+   ```ini
+   ELK_GITLAB_URL=https://gitlab.example.com
+   ELK_GITLAB_TOKEN=glpat-xxxxxxxx
+   ELK_GITLAB_GROUPS=backend          # 可选，只同步这些组（含子组）
+   ELK_REPO_SYNC_INDEX=prod           # 可选，同步后预建 prod 分支索引
+   ```
+3. **启动**：执行 `ELK_IMAGE_TARGET=code docker compose up -d --build`。服务启动约 15 秒后开始第一次同步，之后每 6 小时同步一次。
+
+### 同步规则
+
+| 情况 | 处理方式 |
+|---|---|
+| 同步范围 | 令牌账号是成员的全部项目，或 `ELK_GITLAB_GROUPS` 指定的组；自动跳过归档项目、空仓库，以及 `ELK_GITLAB_EXCLUDE` 命中的项目 |
+| 拉取方式 | 部分 clone（`--filter=blob:none`）：只下载提交和目录结构，文件内容用到时才下载，几十个仓库也只占很少的空间 |
+| 目录命名 | 目录名用项目的 `path`；不同组下有同名项目时，改用 `组_子组_项目` |
+| 本脚本 clone 的仓库 | 每次同步都强制对齐到远程默认分支 |
+| `/repos` 下已有的同一仓库 | 只执行 fetch，不改动其工作区 |
+| 已无权限或已删除的项目 | 只在状态中标记，**不自动删除**，需要时手动删除目录 |
+| 令牌安全 | 通过环境变量注入 git，只发给 `ELK_GITLAB_URL` 这个地址；不写入 `.git/config`，也不出现在命令行参数和日志中 |
+
+### 预建索引
+
+- `ELK_REPO_SYNC_INDEX=prod` 会在每次同步后，**逐个**为仓库的 prod 分支（master/main）构建或增量更新 GitNexus 索引。逐个进行是为了不压垮机器；已是最新的索引会跳过。
+- 每个仓库的索引约占 0.5G，首次构建每个需要几十秒到几分钟。仓库很多时，可以用 `ELK_REPO_SYNC_INDEX_REPOS` 只为核心服务建索引。其余仓库在成员第一次调用 `code_prepare` 时再按需构建。
+- 服务端的 GitNexus 为**只读**：`rename`、`group_sync` 等会改写代码或数据的工具会被拒绝。
+
+### ⚠️ 源码可见范围
+
+同步下来的代码，**所有有 `code` 权限的成员都能通过 `code_locate` 和 `gitnexus-remote` 看到**，即使这个人在 GitLab 上本来没有该仓库的权限。
+
+所以**不要用个人账号的令牌**。建议新建一个专门的服务账号（比如 `elk-bot`），只把它加入团队需要排查的项目组，再用它的令牌；或者用 `ELK_GITLAB_GROUPS` 限定同步范围。对不应接触源码的成员，在 `tokens.json` 中设置 `"code": false`。
+
+### 运维
+
+| 事项 | 命令 |
+|---|---|
+| 查看同步状态 | 在客户端让模型调用 `code_repos`；或执行 `docker compose exec elk-mcp python /app/scripts/elk.py repo-sync --status` |
+| 立即同步 | 管理员调用 `code_repos` 并传入 `sync=true`；或执行 `docker compose exec elk-mcp python /app/scripts/elk.py repo-sync` |
+| 预览同步范围 | `docker compose exec elk-mcp python /app/scripts/elk.py repo-sync --dry-run` |
+| 同步日志 | 容器内 `/data/cache/repo-sync/sync.log`；GitNexus 服务日志在 `/data/cache/gitnexus-mcp.log` |
+| 原生部署 | `python3 scripts/elk.py --env-file deploy/.env repo-sync`；定时同步由 `mcp_http.py` 内置，不需要另配 cron |
+
+## 5. 安全要点
 
 - **必须走 HTTPS**（或只在 VPN / 内网中开放）。token 是 Bearer 凭据，明文 HTTP 下可以被嗅探。
 - 生产环境建议在 Kibana 中**单独建一个只读账号**，并配置 `max_size`。服务端的 `prod` 开关防的是误用，不能代替 ES 侧的权限控制。
 - `.env`、`config/envs.json`、`config/tokens.json` 已加入 `.gitignore`；`.dockerignore` 保证它们不会进入构建上下文。
 - 成员离职时，删除 `tokens.json` 中对应的行即可，立即生效。
 
-## 5. 运维
+## 6. 运维
 
 | 事项 | 命令 |
 |---|---|

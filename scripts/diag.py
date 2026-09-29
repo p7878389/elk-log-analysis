@@ -23,7 +23,8 @@ import elk_core as core
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_MAX = 5 * 1024 * 1024
 CLAUDE_MCP_LOGS = os.path.expanduser("~/Library/Caches/claude-cli-nodejs/*/mcp-logs-elk/*.jsonl")
-GITNEXUS_REGISTRY = os.path.expanduser("~/.gitnexus/registry.json")
+GITNEXUS_REGISTRY = os.path.join(os.path.expanduser(os.environ.get("GITNEXUS_HOME") or "~/.gitnexus"),
+                                 "registry.json")
 
 # (类别, 匹配, 级别, 处理建议)；按顺序匹配第一个
 CATEGORIES = [

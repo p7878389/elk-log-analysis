@@ -11,7 +11,8 @@ clone 仓库后运行，不带参数时逐项询问：
    Claude Code ~/.claude/skills/elk-log-analysis；检测到 Codex 时另装 ~/.codex/skills/elk-log-analysis
 2. 在 Claude Code（~/.claude.json）/ Codex（~/.codex/config.toml）中注册 elk MCP：
    --mode local   本机 stdio 运行 scripts/mcp_server.py，直接连 ELK（环境配置见 references/mcp-config.md）
-   --mode remote  连接团队部署的 HTTP 服务（--url + 个人 token）
+   --mode remote  连接团队部署的 HTTP 服务（--url + 个人 token）；服务端开启了 GitNexus 转发时，
+                  同时注册 gitnexus-remote（查询服务端预建的调用链/影响面索引）
 3. 权限：skill 目录 755/644；含凭据的文件（客户端配置、envs.json、备份）只有当前用户可读写
    （Unix 600/700；Windows 去掉继承的 ACL，只授权当前用户与 SYSTEM）
 """
@@ -432,6 +433,31 @@ def check_local(entry):
         say("  %s %s：%s" % ("✔" if shutil.which(tool) else "·", tool, "已安装" if shutil.which(tool) else "未找到，影响 " + need))
 
 
+def gitnexus_url(url):
+    """elk 端点 …/mcp → GitNexus 转发端点 …/gitnexus/mcp（服务前有路径前缀的反向代理时同样适用）。"""
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path[:-len("/mcp")] if parts.path.endswith("/mcp") else parts.path.rstrip("/")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path + "/gitnexus/mcp", "", ""))
+
+
+def probe_gitnexus(url, token):
+    """服务端是否开启了 GitNexus 转发：带 token 返回 200，或不带 token 返回 401 都说明端点存在；404 表示未开启。"""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                  "clientInfo": {"name": "elk-installer", "version": "1"}}}).encode()
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        with urllib.request.urlopen(urllib.request.Request(gitnexus_url(url), data=body, method="POST",
+                                                           headers=headers), timeout=15):
+            return True
+    except urllib.error.HTTPError as e:
+        return e.code == 401 and not token
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def check_remote(url, token):
     """写入配置前验证：返回 ok / unauthorized / unreachable。"""
     parts = urllib.parse.urlsplit(url)
@@ -524,18 +550,19 @@ def uninstall(args, clients):
             say("  %s：已删除 %s" % (CLIENTS[c]["label"], dest))
         else:
             say("  %s：%s 不是本脚本安装的，保留" % (CLIENTS[c]["label"], dest))
-    data = load_claude()
-    if args.name in data.get("mcpServers", {}) and confirm("  从 Claude Code 移除 MCP「%s」？" % args.name):
-        backup(CLAUDE_JSON, "claude.json")
-        del data["mcpServers"][args.name]
-        atomic_write(CLAUDE_JSON, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-        say("  Claude Code：已移除")
-    if os.path.exists(CODEX_TOML):
-        rest, old = split_codex(open(CODEX_TOML, encoding="utf-8").read(), args.name)
-        if old.strip() and confirm("  从 Codex 移除 [mcp_servers.%s]？" % args.name):
-            backup(CODEX_TOML, "codex-config.toml")
-            atomic_write(CODEX_TOML, rest)
-            say("  Codex：已移除")
+    for name in (args.name, args.gitnexus_name):
+        data = load_claude()
+        if name in data.get("mcpServers", {}) and confirm("  从 Claude Code 移除 MCP「%s」？" % name):
+            backup(CLAUDE_JSON, "claude.json")
+            del data["mcpServers"][name]
+            atomic_write(CLAUDE_JSON, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            say("  Claude Code：已移除 %s" % name)
+        if os.path.exists(CODEX_TOML):
+            rest, old = split_codex(open(CODEX_TOML, encoding="utf-8").read(), name)
+            if old.strip() and confirm("  从 Codex 移除 [mcp_servers.%s]？" % name):
+                backup(CODEX_TOML, "codex-config.toml")
+                atomic_write(CODEX_TOML, rest)
+                say("  Codex：已移除 %s" % name)
     if args.purge and os.path.isdir(CONFIG_DIR) and confirm("  删除 %s（含 envs.json 与所有备份）？" % CONFIG_DIR, False):
         if not DRY:
             shutil.rmtree(CONFIG_DIR)
@@ -555,6 +582,9 @@ def main():
     p.add_argument("--code-root", help="本地模式的源码根目录 ELK_CODE_ROOT，多个用逗号分隔")
     p.add_argument("--clients", help="要配置的客户端，逗号分隔：claude,codex（默认自动检测）")
     p.add_argument("--name", default="elk", help="MCP 名称，默认 elk")
+    p.add_argument("--gitnexus-name", default="gitnexus-remote",
+                   help="远程 GitNexus 的 MCP 名称，默认 gitnexus-remote（与本机的 gitnexus 区分）")
+    p.add_argument("--no-gitnexus", action="store_true", help="远程模式下不注册服务端的 GitNexus")
     p.add_argument("--link", action="store_true", help="用符号链接/junction 指向仓库，而不是复制（git pull 即更新）")
     p.add_argument("--skip-check", action="store_true", help="跳过安装后的连通性检查")
     p.add_argument("--dry-run", action="store_true", help="只显示将要做的操作，不写任何文件")
@@ -585,10 +615,15 @@ def main():
 
     step("注册 MCP（%s）" % ("本地 stdio" if args.mode == "local" else "远程 " + args.url))
     entry = mcp_entry(args, scripts_dir)
-    if "claude" in clients:
-        update_claude(args.name, entry)
-    if "codex" in clients:
-        update_codex(args.name, entry, args.token_store)
+    entries = [(args.name, entry)]
+    if args.mode == "remote" and not args.no_gitnexus and probe_gitnexus(args.url, args.token):
+        say("  检测到服务端提供 GitNexus（%s），一并注册为「%s」" % (gitnexus_url(args.url), args.gitnexus_name))
+        entries.append((args.gitnexus_name, dict(entry, url=gitnexus_url(args.url))))
+    for name, e in entries:
+        if "claude" in clients:
+            update_claude(name, e)
+        if "codex" in clients:
+            update_codex(name, e, args.token_store)
 
     if args.mode == "local":
         step("本地环境配置")

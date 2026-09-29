@@ -16,52 +16,33 @@
   ELK_HTTP_ALLOWED_ORIGINS 允许的 Origin（逗号分隔）；带 Origin 头且不在列表中的请求拒绝（防 DNS rebinding）
   ELK_HTTP_CERT / ELK_HTTP_KEY  证书与私钥路径，配置后直接提供 HTTPS
   ELK_HTTP_MAX_BODY        请求体上限字节数，默认 1048576
+  ELK_GITNEXUS_MCP         =1 时托管一个 gitnexus MCP（仅监听本机），并在 /gitnexus/mcp 以成员 token 转发，
+                           让远程成员直接查询服务端的 GitNexus 索引（调用链/影响面）
+  ELK_GITNEXUS_PORT        托管的 gitnexus MCP 本机端口，默认 8767
+  GitLab 仓库定时同步的配置见 repo_sync.py（ELK_GITLAB_URL / ELK_GITLAB_TOKEN 等），配置后自动启用
 
 token 权限：prod=false（默认）的成员查询生产日志会被拒绝，code_* 退化为按分支最新提交（不查生产日志）；
-admin=false（默认）的成员调用 elk_doctor 时 fix 会被剥离，只能诊断不能修复。
+admin=false（默认）的成员调用 elk_doctor 时 fix 会被剥离，只能诊断不能修复，也不能手动触发仓库同步；
+code=false 的成员不能使用 code_* 与 /gitnexus/mcp（不能查看源码）。
 """
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import secrets
 import ssl
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PATH_KEYS = ("ELK_CONFIG", "ELK_HTTP_TOKENS_FILE", "ELK_HTTP_CERT", "ELK_HTTP_KEY", "ELK_CODE_CACHE")
-
-
-def load_env_file(path):
-    """读取 KEY=VALUE 格式的 .env（与 docker compose env_file 相同：不做引号/变量展开，# 开头为注释）。
-    已存在的环境变量优先；PATH_KEYS 中的相对路径按 .env 所在目录解析，便于各平台原生部署共用一份配置。"""
-    base = os.path.dirname(os.path.abspath(path))
-    with open(path, encoding="utf-8-sig") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = (x.strip() for x in line.split("=", 1))
-            if key in PATH_KEYS and value and not os.path.isabs(os.path.expanduser(value)):
-                value = os.path.join(base, value)
-            if value:
-                os.environ.setdefault(key, value)
-
-
-# 必须在导入 elk_core 之前加载：其 CONFIG_PATH 在导入时读取 ELK_CONFIG
-if "--env-file" in sys.argv:
-    i = sys.argv.index("--env-file")
-    if i + 1 >= len(sys.argv):
-        sys.exit("用法: mcp_http.py --env-file <.env 路径>")
-    load_env_file(sys.argv[i + 1])
-    del sys.argv[i:i + 2]
-elif os.environ.get("ELK_HTTP_ENV_FILE"):
-    load_env_file(os.environ["ELK_HTTP_ENV_FILE"])
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import envfile  # noqa: E402
+
+envfile.apply_from_argv()  # 必须在导入 elk_core 之前：其 CONFIG_PATH 在导入时读取 ELK_CONFIG
 import mcp_server as mcp  # noqa: E402
 
 HOST = os.environ.get("ELK_HTTP_HOST", "127.0.0.1")
@@ -72,6 +53,12 @@ NO_AUTH = os.environ.get("ELK_HTTP_NO_AUTH", "").lower() in ("1", "true", "yes")
 DISABLED = {t.strip() for t in os.environ.get("ELK_HTTP_DISABLED_TOOLS", "").split(",") if t.strip()}
 ORIGINS = {o.strip().rstrip("/") for o in os.environ.get("ELK_HTTP_ALLOWED_ORIGINS", "").split(",") if o.strip()}
 MAX_BODY = int(os.environ.get("ELK_HTTP_MAX_BODY") or 1048576)
+GITNEXUS = os.environ.get("ELK_GITNEXUS_MCP", "").lower() in ("1", "true", "yes")
+GN_PORT = int(os.environ.get("ELK_GITNEXUS_PORT") or 8767)
+GN_PREFIX = "/gitnexus"
+GN_TOKEN = secrets.token_urlsafe(32)  # 仅本进程与托管的 gitnexus 之间使用，每次启动随机生成
+# 会改写服务端 worktree / 索引分组的 gitnexus 工具：共享服务上只读，一律拒绝
+GN_BLOCKED = {"rename", "group_sync"}
 
 
 def sha256(token):
@@ -97,7 +84,8 @@ class Tokens:
             if not t.get("name") or not digest or t.get("disabled"):
                 continue
             items.append({"name": t["name"], "sha256": digest.lower(),
-                          "prod": t.get("prod") is True, "admin": t.get("admin") is True})
+                          "prod": t.get("prod") is True, "admin": t.get("admin") is True,
+                          "code": t.get("code") is not False})
         self.items, self.mtime = items, mtime
         log("已加载 %d 个成员 token（%s）" % (len(items), self.path))
 
@@ -115,7 +103,7 @@ class Tokens:
 
 
 TOKENS = Tokens(TOKENS_FILE) if TOKENS_FILE else None
-ANONYMOUS = {"name": "anonymous", "prod": True, "admin": True}
+ANONYMOUS = {"name": "anonymous", "prod": True, "admin": True, "code": True}
 
 
 def log(msg):
@@ -129,15 +117,19 @@ def restrict(req, user):
         return req, None
     params = dict(req.get("params") or {})
     name, args = params.get("name"), dict(params.get("arguments") or {})
+    def deny(text):
+        log("%s 被拒绝 %s：%s" % (user["name"], name, text[:40]))
+        return req, mcp.reply(req.get("id"), {"content": [{"type": "text", "text": text}], "isError": True})
     if name in DISABLED:
-        return req, mcp.reply(req.get("id"), {"content": [{"type": "text", "text": "工具 %s 已在服务端禁用" % name}],
-                                              "isError": True})
+        return deny("工具 %s 已在服务端禁用" % name)
+    if name.startswith("code_") and not user["code"]:
+        return deny("当前成员（%s）的 token 没有源码查看权限，请联系 elk MCP 管理员，不要重试。" % user["name"])
+    if name == "code_repos" and args.get("sync") is True and not user["admin"]:
+        return deny("只有管理员可以手动触发仓库同步；服务会按计划自动同步，可稍后再查看 code_repos。")
     if not user["prod"] and args.pop("confirm_production", None) is True and name.startswith("elk_") \
             and name != "elk_doctor":
-        log("%s 无生产权限，拒绝 %s" % (user["name"], name))
-        return req, mcp.reply(req.get("id"), {"content": [{"type": "text", "text": (
-            "当前成员（%s）的 token 没有生产环境权限，无法查询生产日志。请告知用户联系 elk MCP 管理员"
-            "在 tokens 文件中为其开启 prod，不要重试。" % user["name"])}], "isError": True})
+        return deny("当前成员（%s）的 token 没有生产环境权限，无法查询生产日志。请告知用户联系 elk MCP 管理员"
+                    "在 tokens 文件中为其开启 prod，不要重试。" % user["name"])
     # code_* 去掉 confirm_production 后按分支最新提交处理，elk_doctor 则跳过生产连通性检查
     if name == "elk_doctor" and not user["admin"]:
         args.pop("fix", None)
@@ -210,15 +202,80 @@ class Handler(BaseHTTPRequestHandler):
         self._error(403, "Origin 不被允许: %s" % origin)
         return False
 
+    def _is_gitnexus(self):
+        return GITNEXUS and (self.path == GN_PREFIX or self.path.startswith(GN_PREFIX + "/"))
+
+    def _proxy_gitnexus(self, body=b""):
+        """以成员 token 鉴权后，把请求转发给本机托管的 gitnexus MCP（换成内部 token）；SSE/分块响应边读边转发。"""
+        if not self._origin_ok():
+            return
+        user = self._auth()
+        if not user:
+            return
+        if not user["code"]:
+            return self._error(403, "当前成员没有源码查看权限")
+        if body:
+            try:
+                req = json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                req = None
+            if isinstance(req, dict) and req.get("method") == "tools/call":
+                tool = (req.get("params") or {}).get("name")
+                log("%s gitnexus:%s" % (user["name"], tool))
+                if tool in GN_BLOCKED:
+                    return self._send(200, mcp.reply(req.get("id"), {"content": [{"type": "text", "text": (
+                        "团队共享的 GitNexus 为只读，不支持 %s。需要重构时请在自己本机的仓库中操作。" % tool)}],
+                        "isError": True}))
+        headers = {k: self.headers[k] for k in ("Content-Type", "Accept", "Mcp-Session-Id",
+                                                 "Mcp-Protocol-Version", "Last-Event-ID") if self.headers.get(k)}
+        headers["Authorization"] = "Bearer " + GN_TOKEN
+        # GET 是服务端推送的长连接，不设读超时
+        conn = http.client.HTTPConnection("127.0.0.1", GN_PORT, timeout=None if self.command == "GET" else 600)
+        try:
+            conn.request(self.command, self.path[len(GN_PREFIX):] or "/", body=body or None, headers=headers)
+            resp = conn.getresponse()
+        except OSError as e:
+            conn.close()
+            return self._error(502, "GitNexus 服务暂不可用（%s），请稍后重试或联系管理员" % e)
+        self.send_response(resp.status)
+        for k in ("Content-Type", "Mcp-Session-Id", "Mcp-Protocol-Version", "Cache-Control", "Allow"):
+            if resp.getheader(k):
+                self.send_header(k, resp.getheader(k))
+        try:
+            if resp.getheader("Content-Length") is not None:
+                data = resp.read()
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        finally:
+            conn.close()
+
     def do_GET(self):
         if self.path.split("?")[0] == "/healthz":
             return self._send(200, b"ok", "text/plain")
+        if self._is_gitnexus():
+            return self._proxy_gitnexus()
         if self.path.split("?")[0] == PATH:  # 不提供服务端推送的 SSE 流
             return self._send(405, headers={"Allow": "POST"})
         self._send(404)
 
-    def do_DELETE(self):  # 无状态服务，没有会话可结束
-        self._send(405, headers={"Allow": "POST"})
+    def do_DELETE(self):
+        if self._is_gitnexus():
+            return self._proxy_gitnexus()
+        self._send(405, headers={"Allow": "POST"})  # elk MCP 无状态，没有会话可结束
 
     def do_POST(self):
         # 先读完请求体再做任何拒绝：keep-alive 下未读的请求体会被当成下一个请求解析
@@ -227,6 +284,8 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return self._error(413, "请求体过大")
         body = self.rfile.read(length) if length > 0 else b""
+        if self._is_gitnexus():
+            return self._proxy_gitnexus(body)
         if self.path.split("?")[0] != PATH:
             return self._send(404)
         if not self._origin_ok():
@@ -245,6 +304,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, out) if out else self._send(202)
         msg = process(req, user)
         self._send(200, msg) if msg is not None else self._send(202)
+
+
+def start_gitnexus():
+    """托管 gitnexus MCP（只监听 127.0.0.1，内部 token 经环境变量传入，不出现在命令行）；退出后自动重启。"""
+    ccfg = mcp.code.load_code_config()
+    gn = ccfg["gitnexus"]
+    if not os.path.exists(gn):
+        log("未找到 gitnexus（%s），/gitnexus/mcp 不可用" % gn)
+        return
+    logfile = os.path.join(mcp.code._cache_dir(ccfg), "gitnexus-mcp.log")
+    env = dict(mcp.code._gitnexus_env(ccfg), GITNEXUS_MCP_AUTH_TOKEN=GN_TOKEN)
+
+    def loop():
+        while True:
+            with open(logfile, "a", encoding="utf-8") as out:
+                proc = subprocess.Popen([gn, "mcp", "--http", "--host", "127.0.0.1", "--port", str(GN_PORT)],
+                                        env=env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                log("gitnexus MCP 已启动（pid %d，127.0.0.1:%d，转发路径 %s/mcp）" % (proc.pid, GN_PORT, GN_PREFIX))
+                code = proc.wait()
+            log("gitnexus MCP 退出（%s），5 秒后重启，详见 %s" % (code, logfile))
+            time.sleep(5)
+
+    threading.Thread(target=loop, name="gitnexus-mcp", daemon=True).start()
 
 
 def gen_token(name):
@@ -277,6 +359,17 @@ def main():
         scheme = "https"
     log("elk MCP HTTP 服务已启动: %s://%s:%d%s（鉴权: %s，禁用工具: %s）"
         % (scheme, HOST, PORT, PATH, "关闭" if NO_AUTH else "Bearer token", ",".join(sorted(DISABLED)) or "无"))
+    scfg = mcp.repo_sync.load_sync_config()
+    if scfg:
+        if not scfg["token"]:
+            log("已配置 ELK_GITLAB_URL 但缺少 ELK_GITLAB_TOKEN，仓库同步未启用")
+        else:
+            mcp.repo_sync.start_scheduler(scfg, log)
+            log("GitLab 仓库同步已启用：%s → %s，%s%s" % (
+                scfg["url"], scfg["dir"], "每 %d 秒" % scfg["interval"] if scfg["interval"] else "仅手动触发",
+                "，同步后预建 %s 分支索引" % ",".join(scfg["index_envs"]) if scfg["index_envs"] else ""))
+    if GITNEXUS:
+        start_gitnexus()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

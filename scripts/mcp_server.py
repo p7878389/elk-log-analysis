@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import code_core as code  # noqa: E402
 import diag  # noqa: E402
 import elk_core as core  # noqa: E402
+import repo_sync  # noqa: E402
 
 SERVER_INFO = {"name": "elk-log-analysis", "version": "1.0.0"}
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -144,6 +145,14 @@ TOOLS += [
 
 
 TOOLS.append(
+    {"name": "code_repos",
+     "description": "GitLab 仓库同步状态：同步范围、上次/下次同步时间、失败项与已同步仓库清单。"
+                    "新建仓库还没同步到、code_* 报找不到仓库时查看；sync=true 立即在后台同步一次",
+     "inputSchema": schema({"grep": {"type": "string", "description": "按仓库名/路径过滤清单"},
+                            "sync": {"type": "boolean",
+                                     "description": "立即触发一次后台同步（团队服务中仅管理员可用）"}})})
+
+TOOLS.append(
     {"name": "elk_doctor",
      "description": "elk MCP 自检：配置/凭据可用性、各环境连通性与关键字段、git/gitnexus 依赖、服务→代码映射覆盖率、"
                     "缓存 worktree 与 GitNexus 索引健康、MCP 进程是否运行旧代码、近 N 天调用日志与 Claude Code MCP 日志的错误分类。"
@@ -189,6 +198,15 @@ def handle_tool(name, a):
     if name == "elk_doctor":
         return diag.run_doctor(a.get("fix") is True, a.get("connectivity") is not False,
                                a.get("confirm_production") is True, code.int_arg(a, "days", 7))
+    if name == "code_repos":
+        scfg = repo_sync.load_sync_config()
+        note = ""
+        if a.get("sync") is True:
+            if scfg is None:
+                raise core.ElkError("未配置 GitLab 仓库同步（ELK_GITLAB_URL / ELK_GITLAB_TOKEN）")
+            note = ("已触发后台同步，稍后再调用 code_repos 查看结果\n\n" if repo_sync.request_sync(scfg)
+                    else "同步已在进行中，稍后再调用 code_repos 查看结果\n\n")
+        return note + repo_sync.describe(scfg, a.get("grep"))
     if name.startswith("code_"):
         return handle_code_tool(name, a)
     env = resolve_env(a)

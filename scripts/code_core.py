@@ -5,6 +5,7 @@
 - 绝不改动用户工作区：只执行 git fetch（更新 origin/* 远程跟踪引用），代码检出在缓存目录的独立 worktree（--detach）。
 - 读取某个 commit 的源码一律用 git show / ls-tree，不依赖 worktree 当前检出状态。
 """
+import base64
 import difflib
 import json
 import os
@@ -59,11 +60,16 @@ def load_code_config(environ=None):
     roots = [os.path.expanduser(r.strip())
              for r in re.split(r"[,\n%s]" % re.escape(os.pathsep), environ.get("ELK_CODE_ROOT") or "")
              if r.strip()]
+    # 仓库同步目录（repo_sync.py）总是参与扫描；未单独指定时同步到第一个代码目录
+    sync_dir = os.path.expanduser(environ.get("ELK_REPO_SYNC_DIR") or "") or (roots[0] if roots else "")
+    if sync_dir and sync_dir not in roots:
+        roots.append(sync_dir)
     legacy = core._json(environ.get("ELK_CODE_BRANCHES"), "ELK_CODE_BRANCHES")
     branches = dict(DEFAULT_BRANCHES)
     branches.update(legacy)
     return {
         "roots": roots,
+        "sync_dir": sync_dir,
         "branches": branches,
         "branches_legacy": legacy,
         "cache": os.path.expanduser(environ.get("ELK_CODE_CACHE") or "~/.cache/elk-log-analysis"),
@@ -111,9 +117,28 @@ def _memo(key, ttl, fn):
     return val
 
 
+def gitlab_auth_env(environ):
+    """配置了 ELK_GITLAB_URL + ELK_GITLAB_TOKEN 时，给 git 进程注入限定在该 GitLab 地址的认证头。
+    经 GIT_CONFIG_* 环境变量传入（git 2.31+）：不写入 .git/config、不出现在命令行参数与 remote URL 中，
+    也不会发给其他主机。ELK_GITLAB_CA_CERT 为内部 CA 证书路径（自签证书时使用）。"""
+    url, token = (environ.get("ELK_GITLAB_URL") or "").rstrip("/"), environ.get("ELK_GITLAB_TOKEN") or ""
+    if not url or not token:
+        return {}
+    basic = base64.b64encode(("oauth2:" + token).encode()).decode()
+    items = [("http.%s/.extraHeader" % url, "Authorization: Basic " + basic)]
+    if environ.get("ELK_GITLAB_CA_CERT"):
+        items.append(("http.%s/.sslCAInfo" % url, os.path.expanduser(environ["ELK_GITLAB_CA_CERT"])))
+    n = int(environ.get("GIT_CONFIG_COUNT") or 0)
+    out = {"GIT_CONFIG_COUNT": str(n + len(items))}
+    for i, (k, v) in enumerate(items, n):
+        out["GIT_CONFIG_KEY_%d" % i], out["GIT_CONFIG_VALUE_%d" % i] = k, v
+    return out
+
+
 def git(cwd, *args, timeout=60, check=True):
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+    env.update(gitlab_auth_env(env))
     cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
            "-c", "maintenance.auto=false"] + list(args)
     try:

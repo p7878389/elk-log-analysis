@@ -20,6 +20,7 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 | `code_services` | `ELK_CODE_ROOT` 下「应用名 ↔ 仓库/模块」清单；传 `host`/`service` 只看映射结果（无 git 操作） |
 | `code_locate` | 把堆栈定位到**该环境分支**的源码：业务帧 → 文件:行号 + 代码片段（根因优先），默认按部署时间对齐 commit |
 | `code_prepare` | 准备该环境的只读 worktree，检查/后台构建 GitNexus 索引，返回 worktree 路径与 gitnexus `repo` 名 |
+| `code_repos` | GitLab 仓库同步状态与已同步仓库清单；找不到仓库时先看这里（`sync:true` 手动同步，团队服务中仅管理员可用） |
 | `elk_doctor` | 自检：配置/凭据、连通性与字段、依赖、服务映射覆盖率、缓存与索引健康、MCP 进程是否跑旧代码、近 N 天日志错误分类；`fix:true` 只修复缓存/运行时状态 |
 
 - 工具名在 Claude Code 中为 `mcp__elk__<tool>`；若工具未加载，先用 ToolSearch 搜索 `elk`。
@@ -91,6 +92,9 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 
 elk MCP 也可以作为 HTTP 服务部署在服务器上供团队共用（部署方式见 `deploy/README.md`）。连接的是远程服务时：
 
-- `code_locate` 返回的代码片段可以直接使用；但 worktree 路径和 GitNexus 索引都**在服务器上**，本机读不到。需要调用链时，改在用户本机的仓库中分析。`code_prepare` 默认在服务端禁用。
-- 返回“token 没有生产环境权限”时，**不要重试**。转告用户联系 elk MCP 管理员开通即可。
-- `elk_doctor` 检查的是服务端的配置与缓存。`fix:true` 只有管理员 token 才会生效。配置或凭据问题请转告管理员，不要让用户去改本机的 cc-switch。
+- **代码来自服务端**：服务端定时从 GitLab 同步仓库。`code_locate` 返回的代码片段可以直接使用；worktree 路径指的是服务器上的目录，**不要尝试在本机读取**。
+- **调用链、影响面**：如果已连接 `gitnexus-remote`（服务端的 GitNexus），先用 `code_prepare` 拿到 `repo` 名（如 `order-platform@master`），再用 `gitnexus-remote` 的 `query`/`context`/`impact` 等工具，并传入这个 `repo`。索引状态为「构建中」时稍后再查。没有连接 `gitnexus-remote` 时，改在用户本机的仓库中分析。
+- **服务端 GitNexus 只读**：`rename` 等会改写代码的工具会被拒绝。需要重构时，回到用户本机的仓库操作。
+- **找不到仓库或服务**：先调用 `code_repos` 看同步状态。新建的仓库可能还没同步到，告诉用户等下一次同步，或请管理员手动触发（`code_repos sync:true` 只有管理员可用）。
+- **权限不足时不要重试**：返回“没有生产环境权限”或“没有源码查看权限”时，转告用户联系 elk MCP 管理员开通即可。
+- **自检对象是服务端**：`elk_doctor` 检查的是服务端的配置与缓存，`fix:true` 只有管理员 token 才会生效。配置、凭据或同步问题请转告管理员，不要让用户去改本机的 cc-switch。

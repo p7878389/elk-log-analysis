@@ -8,5 +8,7 @@
 		transport http {
 			read_timeout 300s
 		}
+		# /gitnexus/mcp 的响应是 SSE 流，立即转发不缓冲
+		flush_interval -1
 	}
 }

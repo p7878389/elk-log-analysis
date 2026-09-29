@@ -1,7 +1,7 @@
 # 用法（在 deploy 目录下）：
 #   cp .env.example .env && cp config/envs.example.json config/envs.json && cp config/tokens.example.json config/tokens.json
 #   docker compose up -d --build                 # 仅日志查询
-#   ELK_IMAGE_TARGET=code docker compose up -d --build   # 含 code_* 源码分析（需挂载 /repos）
+#   ELK_IMAGE_TARGET=code docker compose up -d --build   # 含源码分析 + GitLab 仓库定时同步 + 服务端 GitNexus
 #   docker compose --profile tls up -d --build   # 同时启动 Caddy 自动 HTTPS（需公网域名，见 Caddyfile）
 services:
   elk-mcp:
@@ -21,9 +21,9 @@ services:
     #   - "kibana.example.com:10.0.0.10"
     volumes:
       - ./config:/config:ro          # envs.json / tokens.json，挂目录而非单文件，tokens 修改后自动生效
-      - elk-data:/data               # 调用日志、worktree、GitNexus 索引缓存
-      # code_* 需要：服务端的源码仓库目录（会执行 git fetch / worktree add，需可写）与拉代码用的 SSH key
-      # - /srv/repos:/repos
+      - elk-data:/data               # 调用日志、worktree、GitNexus 索引与登记表（GITNEXUS_HOME=/data/gitnexus）
+      - elk-repos:/repos             # GitLab 同步下来的仓库（部分 clone）；想放到指定磁盘可改为 /srv/repos:/repos
+      # 不用 GitLab 令牌、改用 SSH 拉取已有仓库时，挂载只读 deploy key：
       # - ~/.ssh/elk_deploy_key:/home/elk/.ssh/id_ed25519:ro
       # - ~/.ssh/known_hosts:/home/elk/.ssh/known_hosts:ro
 
@@ -40,4 +40,5 @@ services:
 
 volumes:
   elk-data:
+  elk-repos:
   caddy-data:
