@@ -136,13 +136,23 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 
 1. **选择认证方式**，在 `.env` 中填写对应的凭据（各方式的完整写法见 `.env.example`）：
 
+   GitLab 的 API（用来列出项目）只接受令牌或账号密码；**SSH 只能用来拉代码**。所以认证分两部分：API 凭据，以及拉代码的协议。
+
    | 方式 | `.env` 配置 | 说明 |
    |---|---|---|
+   | **自动检测**（什么都不填） | — | API：读取本机 git 凭据管理器里已保存的该 GitLab 账号（macOS 钥匙串、Windows 凭据管理器、Linux store/cache），像令牌的按令牌验证，否则按密码验证。拉代码：**先试 SSH**（沿用本机 `~/.ssh` 配置和 ssh-agent），不通再用 HTTPS。适合原生部署在自己电脑上、并且以前用 git 登录过 GitLab 的情况 |
    | **访问令牌**（推荐） | `ELK_GITLAB_TOKEN` | 个人、组或项目令牌都可以，权限选 `read_api` + `read_repository`；可设有效期，随时吊销 |
    | **账号密码** | `ELK_GITLAB_USERNAME` + `ELK_GITLAB_PASSWORD` | GitLab API 不接受密码直接访问，服务会先用 OAuth 密码模式换取临时令牌，过期前自动续期。**账号开启了双因素认证、或只能通过 SSO 登录时不可用**。较新版本的 GitLab 可能关闭了密码授权，或要求提供 OAuth 应用（`ELK_GITLAB_CLIENT_ID/SECRET`），无法满足时，会提示改用令牌 |
    | **OAuth 令牌** | `ELK_GITLAB_AUTH=oauth` + `ELK_GITLAB_TOKEN` | 适合已有统一签发令牌的系统；令牌过期需要外部更新 |
 
-   - **拉取协议**：默认用 HTTPS，凭据同上。设置 `ELK_GITLAB_GIT_PROTOCOL=ssh` 和 `ELK_GITLAB_SSH_KEY` 后改用 SSH 拉取；列项目的 API 仍然用上面的凭据。私钥放在 `config/` 下，属主要改为 10001，权限设为 600。切换协议后，已同步仓库的 origin 会自动改写。
+   - **拉取协议** `ELK_GITLAB_GIT_PROTOCOL`：默认 `auto`，**SSH 优先**，不通再用 HTTPS；也可以固定为 `ssh` 或 `https`。优先 SSH 的原因：
+     - 密钥不会过期，改密码也不影响。
+     - 不受双因素认证、SSO，以及管理员关闭「HTTPS 密码拉取」的影响。
+     - 程序里不需要接触明文密码。
+
+     常见的失败原因是公司网络封了 22 端口，这时会自动改用 HTTPS。容器里要用 SSH 时，需要设置 `ELK_GITLAB_SSH_KEY`：把私钥放在 `config/` 下，属主改为 10001，权限设为 600。切换协议后，已同步仓库的 origin 会自动改写。
+   - **只读承诺**：自动检测只读取凭据管理器和 `~/.ssh`，不做任何修改。访问 GitLab 时，git 的凭据管理器调用被关闭，改由程序注入凭据，所以认证失败时 git 也不会删除你保存的账号（git 默认会删）。检测过程不会弹出登录或授权窗口。
+   - **Docker 部署**：容器里看不到宿主机的钥匙串和 `~/.ssh`，自动检测一般找不到凭据，请用令牌或账号密码显式配置。
    - **凭据放在文件里**：每个凭据变量都可以改成 `<变量>_FILE` 指向一个文件，兼容 Docker secrets。
 2. **填写同步范围等其他选项**（可选）：
    ```ini
@@ -150,10 +160,11 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
    ELK_GITLAB_GROUPS=backend          # 只同步这些组（含子组）
    ELK_REPO_SYNC_INDEX=prod           # 同步后预建 prod 分支索引
    ```
-3. **验证凭据**，确认能登录再启动：
+3. **验证凭据**：`--check` 会验证 API 凭据，并**分别实测 SSH 和 HTTPS 两种拉取方式**，报告各自结果以及同步时会选用哪一种：
    ```bash
    docker compose run --rm elk-mcp python /app/scripts/elk.py repo-sync --check
    ```
+   原生部署时执行 `python3 scripts/elk.py --env-file deploy/.env repo-sync --check`。
 4. **启动**：执行 `ELK_IMAGE_TARGET=code docker compose up -d --build`。服务启动约 15 秒后开始第一次同步，之后每 6 小时同步一次。
 
 ### 同步规则
@@ -178,7 +189,7 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 
 同步下来的代码，**所有有 `code` 权限的成员都能通过 `code_locate` 和 `gitnexus-remote` 看到**，即使这个人在 GitLab 上本来没有该仓库的权限。
 
-所以**不要用个人账号的令牌**。建议新建一个专门的服务账号（比如 `elk-bot`），只把它加入团队需要排查的项目组，再用它的令牌；或者用 `ELK_GITLAB_GROUPS` 限定同步范围。对不应接触源码的成员，在 `tokens.json` 中设置 `"code": false`。
+所以团队共享时**不要用个人账号的令牌**，也不要依赖「自动检测」读取你本机保存的个人账号。建议新建一个专门的服务账号（比如 `elk-bot`），只把它加入团队需要排查的项目组，再用它的令牌；或者用 `ELK_GITLAB_GROUPS` 限定同步范围。对不应接触源码的成员，在 `tokens.json` 中设置 `"code": false`。
 
 ### 运维
 

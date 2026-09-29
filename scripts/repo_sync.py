@@ -23,9 +23,7 @@ import shutil
 import subprocess
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -85,24 +83,7 @@ def _log(scfg, msg):
 # ---------------------------------------------------------------- GitLab API
 
 def _api(scfg, path, params=None):
-    """GET /api/v4<path>，返回 (数据, 下一页页码或 None)。令牌只放在请求头，错误信息中不含令牌。"""
-    qs = "?" + urllib.parse.urlencode(params) if params else ""
-    auth = scfg["auth"]
-    for attempt in (1, 2):
-        req = urllib.request.Request(scfg["url"] + "/api/v4" + path + qs,
-                                     headers=dict(gitlab_auth.api_headers(auth), Accept="application/json"))
-        try:
-            with urllib.request.urlopen(req, timeout=30, context=gitlab_auth._ssl(auth)) as r:
-                return json.loads(r.read().decode("utf-8")), (r.headers.get("X-Next-Page") or None)
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and auth["mode"] == "password" and attempt == 1:
-                gitlab_auth.invalidate(auth)  # 临时令牌提前失效：重新换取后重试一次
-                continue
-            hint = {401: "凭据无效或已过期", 403: "凭据缺少 read_api 权限",
-                    404: "组或路径不存在（或无权限）"}.get(e.code, "")
-            raise core.ElkError("GitLab API %s 返回 %s %s" % (path, e.code, hint or e.reason))
-        except (urllib.error.URLError, OSError) as e:
-            raise core.ElkError("无法访问 GitLab（%s）：%s" % (scfg["url"], getattr(e, "reason", e)))
+    return gitlab_auth.api(scfg["auth"], path, params)
 
 
 def _paged(scfg, path, params):
@@ -114,12 +95,56 @@ def _paged(scfg, path, params):
 
 
 def check_login(scfg):
-    """验证凭据：返回 GitLab 上的用户名。"""
+    """确定并验证 API 凭据（auto 时从 git 凭据管理器检测），返回 GitLab 用户名。"""
     bad = gitlab_auth.problem(scfg["auth"])
     if bad:
         raise core.ElkError(bad)
-    user, _ = _api(scfg, "/user")
-    return user.get("username") or user.get("name") or "?"
+    return gitlab_auth.resolve_api(scfg["auth"])
+
+
+def check_all(scfg):
+    """repo-sync --check：API 凭据 + SSH、HTTPS 两种拉取方式都实测一遍，报告各自结果与将采用的方式。"""
+    auth = scfg["auth"]
+    lines = ["GitLab: %s" % scfg["url"]]
+    try:
+        user = check_login(scfg)
+    except core.ElkError as e:
+        return "\n".join(lines + ["✘ API：%s" % e])
+    lines.append("✔ API：以 %s 登录（%s）" % (user, gitlab_auth.describe(auth).split("；")[0][4:]))
+    lines += ["  · " + d for d in auth["detect"]]
+    data, _ = _api(scfg, "/groups/%s/projects" % urllib.parse.quote(scfg["groups"][0], safe="")
+                   if scfg["groups"] else "/projects",
+                   {"membership": "true", "archived": "false", "per_page": 1, "include_subgroups": "true"})
+    if not data:
+        return "\n".join(lines + ["· 账号下没有可见项目，无法测试拉取"])
+    p = data[0]
+    lines.append("用项目 %s 测试拉取：" % p.get("path_with_namespace"))
+    results = gitlab_auth.probe_transports(auth, p.get("http_url_to_repo"), p.get("ssh_url_to_repo"),
+                                           stop_on_success=False) if auth["protocol"] == "auto" else \
+        gitlab_auth.probe_transports(auth, p.get("http_url_to_repo"), p.get("ssh_url_to_repo"))
+    for proto, ok, why in results:
+        lines.append("  %s %s%s" % ("✔" if ok else "✘", proto.upper(), "" if ok else "：%s" % why))
+    chosen = next((proto for proto, ok, _ in results if ok), None)
+    lines.append("→ 同步时将使用 %s 拉取代码" % chosen.upper() if chosen else "✘ 两种方式都无法拉取代码")
+    return "\n".join(lines)
+
+
+def choose_transport(scfg, projects):
+    """确定拉代码的协议（auto：SSH 优先，不通用 HTTPS），并给每个项目填上 clone 地址。
+    以前几个项目实测，避免某一个项目的权限特例导致误判。"""
+    auth, last = scfg["auth"], None
+    for p in projects[:3]:
+        try:
+            gitlab_auth.resolve_transport(auth, p["http_url"], p["ssh_url"])
+            break
+        except core.ElkError as e:
+            last = e
+    else:
+        if projects:
+            raise last
+    for p in projects:
+        p["url"] = gitlab_auth.clone_url(auth, p)
+    return projects
 
 
 def list_projects(scfg):
@@ -141,7 +166,8 @@ def list_projects(scfg):
             continue
         seen.add(p["id"])
         out.append({"id": p["id"], "path": p["path"], "path_with_namespace": pwn,
-                    "url": gitlab_auth.clone_url(scfg["auth"], p), "default_branch": p.get("default_branch") or ""})
+                    "http_url": p.get("http_url_to_repo") or "", "ssh_url": p.get("ssh_url_to_repo") or "",
+                    "default_branch": p.get("default_branch") or ""})
     return out
 
 
@@ -347,10 +373,14 @@ def _run_sync(scfg, index, say):
               "cloned": [], "updated": 0, "adopted": [], "failed": [], "stale": [],
               "indexed": [], "index_fresh": 0, "index_failed": [], "index_skipped": None}
     _write_status(scfg, report)
+    scfg["auth"] = gitlab_auth.load()  # 每次重新检测：本机凭据或 SSH 配置变化后下次同步即生效
     try:
         report["user"] = check_login(scfg)
-        projects = list_projects(scfg)
+        projects = choose_transport(scfg, list_projects(scfg))
+        report["auth"] = gitlab_auth.describe(scfg["auth"])
+        report["detect"] = scfg["auth"]["detect"]
     except core.ElkError as e:
+        report["detect"] = scfg["auth"]["detect"]
         report.update(running=False, error=str(e), finished=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         _write_status(scfg, report)
         say(_log(scfg, "同步失败：%s" % e))
@@ -467,7 +497,9 @@ def describe(scfg, grep=None):
         return ("未配置 GitLab 仓库同步。在服务端 .env 中设置 ELK_GITLAB_URL 与 ELK_GITLAB_TOKEN"
                 "（read_api + read_repository）后，会定时把有权限的仓库同步到代码目录。")
     lines = ["# GitLab 仓库同步",
-             "GitLab: %s（%s）" % (scfg["url"], gitlab_auth.problem(scfg["auth"]) or gitlab_auth.describe(scfg["auth"])),
+             "GitLab: %s" % scfg["url"],
+             "认证: %s" % (gitlab_auth.problem(scfg["auth"]) or (read_status(scfg) or {}).get("auth")
+                          or gitlab_auth.describe(scfg["auth"])),
              "范围: %s%s" % ("组 " + ",".join(scfg["groups"]) if scfg["groups"]
                                           else "账号可访问的全部项目",
                                           "  排除: " + ",".join(scfg["exclude"]) if scfg["exclude"] else ""),
@@ -492,6 +524,8 @@ def describe(scfg, grep=None):
             if st.get("indexed") or st.get("index_failed") or st.get("index_fresh"):
                 lines.append("索引: 新建/更新 %d，已是最新 %d，失败 %d" % (
                     len(st.get("indexed", [])), st.get("index_fresh", 0), len(st.get("index_failed", []))))
+        for d in st.get("detect", []):
+            lines.append("  · " + d)
         for f in st.get("failed", [])[:10]:
             lines.append("  ✘ %s：%s" % (f["repo"], f["error"][:160]))
         for f in st.get("index_failed", [])[:10]:

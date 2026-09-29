@@ -111,8 +111,7 @@ def run(args):
         if args.status or scfg is None:
             return repo_sync.describe(scfg)
         if args.check:
-            return "✔ 已登录 GitLab：%s（%s）" % (repo_sync.check_login(scfg),
-                                               repo_sync.gitlab_auth.describe(scfg["auth"]))
+            return repo_sync.check_all(scfg)
         if args.no_index:
             scfg["index_envs"] = []
         if args.dry_run:
