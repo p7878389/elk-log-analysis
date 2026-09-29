@@ -75,7 +75,7 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
   - 「需要你处理」的项（cc-switch 配置、凭据、在其他会话重连 MCP）原样转告，不要自己改配置或结束进程。
 - **遇到 `[FAIL] MCP 代码缺陷`**：报告给出了代码位置。先向用户说明原因和修复方案，同意后再修改 skill 代码。skill 目录已纳入 git，改完给出 `git diff` 供审阅。
 - **调用日志**：每次调用都会写入 `~/.cache/elk-log-analysis/mcp.log`，记录工具名、env、参数键名、耗时、错误类别、出错位置和自愈事件，不记录参数值、日志内容和凭据。超过 5MB 时轮转。
-- **命令行等价命令**：`python3 ~/.cc-switch/skills/elk-log-analysis/scripts/elk.py doctor [--fix] [--no-conn]`。它会自动套用 `~/.claude.json` 中 elk MCP 的 env，诊断结果与 MCP 一致。
+- **命令行等价命令**：`python3 <skill 目录>/scripts/elk.py doctor [--fix] [--no-conn]`（skill 目录一般是 `~/.claude/skills/elk-log-analysis`）。它会自动套用 `~/.claude.json` 中 elk MCP 的 env，诊断结果与 MCP 一致。
 
 ## 5. 常见问题
 

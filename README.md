@@ -27,39 +27,60 @@
 - 凭据不会出现在工具返回值中。
 - 不会改动你本机的代码工作区。
 
-## 安装 Skill
+## 安装
 
-**通过 cc-switch**：进入 Skills 页面，添加仓库 `p7878389/elk-log-analysis`，分支填 `main`，然后安装 `elk-log-analysis`。
-
-**手动安装**：
+clone 仓库后运行安装脚本。不带参数时会逐项询问：选远程还是本地、服务地址、token（输入时不回显）。
 
 ```bash
-git clone https://github.com/p7878389/elk-log-analysis.git ~/.cc-switch/skills/elk-log-analysis
+git clone https://github.com/p7878389/elk-log-analysis.git
+cd elk-log-analysis
+./install.sh
 ```
 
-Windows 上的路径是 `%USERPROFILE%\.cc-switch\skills\elk-log-analysis`。clone 完成后，在 cc-switch 的 Skills 页面扫描并导入本地 skill。不用 cc-switch 的话，clone 到 `~/.claude/skills/elk-log-analysis` 即可。
+Windows 上在 PowerShell 中运行：
 
-## 接入 MCP
-
-### 方式一：连接团队的远程服务（推荐）
-
-向管理员要服务地址和个人 token，把 token 设为环境变量 `ELK_MCP_TOKEN`，然后执行：
-
-```bash
-claude mcp add --transport http -s user elk https://<服务地址>/mcp --header 'Authorization: Bearer ${ELK_MCP_TOKEN}'
+```powershell
+git clone https://github.com/p7878389/elk-log-analysis.git
+cd elk-log-analysis
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-cc-switch、Codex、Cursor、Claude Desktop 的配置写法，见 [deploy/README.md](deploy/README.md#3-成员客户端配置)。
+安装脚本会做三件事：
 
-### 方式二：本机运行（stdio）
+1. **安装 skill**：复制到 `~/.claude/skills/elk-log-analysis`；检测到 Codex 时，另装一份到 `~/.codex/skills/elk-log-analysis`。Windows 上 `~` 即 `%USERPROFILE%`。
+2. **注册 MCP**：写入 Claude Code 的 `~/.claude.json` 和 Codex 的 `~/.codex/config.toml`。原文件会先备份，已有同名条目时会先询问。
+3. **设置权限**：
+   - skill 目录为 755/644。
+   - 可能含 token 或凭据的文件（客户端配置、`envs.json`、备份）只有本人可读写：macOS/Linux 为 600/700；Windows 会去掉继承的 ACL，只授权本人和 SYSTEM。
 
-在 cc-switch 中新增一个 MCP，或者直接执行：
+### 两种调用方式
 
-```bash
-claude mcp add -s user elk -e ELK_CODE_ROOT=~/code -- python3 ~/.cc-switch/skills/elk-log-analysis/scripts/mcp_server.py
-```
+| | 远程（推荐） | 本地 |
+|---|---|---|
+| 原理 | 连接团队部署的 HTTP 服务 | 本机运行 `scripts/mcp_server.py`，直接连 ELK |
+| 需要什么 | 服务地址和个人 token（向管理员索取） | 自己配置 ELK 地址和凭据 |
+| 命令 | `./install.sh --mode remote --url https://<服务地址>/mcp` | `./install.sh --mode local --code-root ~/code` |
+| 生产权限 | 由管理员按人控制 | 取决于你自己的 ELK 账号 |
 
-环境配置（Kibana/ES 地址、索引、凭据、字段映射）的写法，见 [references/mcp-config.md](references/mcp-config.md)。
+远程模式在**写入任何配置之前**会先验证 token，token 无效时直接退出，不做任何改动。本地模式会从模板生成 `~/.config/elk-log-analysis/envs.json`，并提示凭据的存放方式：macOS 放钥匙串，Windows 和 Linux 放环境变量。配置项说明见 [references/mcp-config.md](references/mcp-config.md)。
+
+### 常用选项
+
+| 选项 | 作用 |
+|---|---|
+| `--token-stdin` | 从标准输入读取 token，适合脚本批量安装 |
+| `--token-store env` | 配置中只引用环境变量 `ELK_MCP_TOKEN`，不写入 token 本身 |
+| `--clients claude,codex` | 指定要配置的客户端（默认自动检测） |
+| `--link` | 用符号链接（Windows 上用 junction）指向仓库，不复制文件；之后 `git pull` 即生效 |
+| `--dry-run` | 只显示将要执行的操作，不写入任何文件 |
+| `-y` | 非交互，已有条目直接替换（会先备份） |
+| `--uninstall [--purge]` | 卸载 skill 和 MCP 条目；加 `--purge` 同时删除本地配置和备份 |
+
+**更新**：`git pull` 之后重新运行安装脚本。重复运行是安全的，配置没有变化时不会重复写入。
+
+**使用 cc-switch 的话**：安装后可以在 cc-switch 的 MCP 和 Skills 页面用「从应用导入」统一管理。注意，如果 cc-switch 里已经有同名的 `elk` 条目，它同步时会覆盖安装脚本写入的配置。
+
+其他客户端（Cursor、Claude Desktop 等）的手动配置方法，见 [deploy/README.md](deploy/README.md#3-成员客户端配置)。
 
 ## 部署远程服务
 

@@ -411,7 +411,7 @@ def load_config():
                        "（{\"default_env\":\"test\",\"environments\":[{\"env\":\"test\",\"url\":\"...\"}]}），"
                        "或创建 %s（模板见 skill 目录 envs.example.json）。" % CONFIG_PATH)
     mode = os.stat(CONFIG_PATH).st_mode & 0o777
-    if mode & 0o077:
+    if mode & 0o077 and os.name != "nt":  # Windows 权限由 ACL 控制，st_mode 恒为 666，无参考意义
         print("[elk] 警告: %s 权限为 %o，建议 chmod 600" % (CONFIG_PATH, mode), file=sys.stderr)
     with open(CONFIG_PATH, encoding="utf-8") as f:
         text = f.read()

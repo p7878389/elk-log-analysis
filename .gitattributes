@@ -1,0 +1,4 @@
+# Windows 用户 clone 时保持脚本可用：sh 必须 LF，ps1 用 CRLF
+*.sh   text eol=lf
+*.py   text eol=lf
+*.ps1  text eol=crlf

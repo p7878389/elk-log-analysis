@@ -64,6 +64,8 @@ python3 scripts/mcp_http.py gen-token alice
 
 ## 3. 成员客户端配置
 
+**推荐直接用安装脚本**：clone 仓库后运行 `./install.sh --mode remote --url https://elk-mcp.example.com/mcp`（Windows 上用 `install.ps1`），会自动安装 skill、写入 Claude Code 和 Codex 的配置，并设置好文件权限，详见[根目录 README](../README.md#安装)。下面是手动配置的方法，供其他客户端或不方便运行脚本时参考。
+
 先把自己的 token 设成环境变量 `ELK_MCP_TOKEN`，这样配置文件里就不用写明文 token：
 
 | 系统 | 命令（设置后重开终端或客户端） |

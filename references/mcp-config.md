@@ -17,7 +17,7 @@
 {
   "type": "stdio",
   "command": "/usr/bin/python3",
-  "args": ["/Users/<你>/.cc-switch/skills/elk-log-analysis/scripts/mcp_server.py"],
+  "args": ["/Users/<你>/.claude/skills/elk-log-analysis/scripts/mcp_server.py"],
   "env": {"ELK_CODE_ROOT": "~/code"},
   "elk": {
     "default_env": "test",
@@ -51,7 +51,7 @@
 - 字段写错（如 `indx`）不会生效，`elk_doctor` 会提示正确写法。
 - **从其他写法迁移**：执行下面的命令，它按当前生效的配置生成 elk 对象（明文密码会改为 `env:` 引用，不会输出明文，粘贴到 cc-switch 后再把引用替换为真实密码）：
   ```bash
-  python3 ~/.cc-switch/skills/elk-log-analysis/scripts/elk.py config-export
+  python3 ~/.claude/skills/elk-log-analysis/scripts/elk.py config-export
   ```
 
 ## envs.json 写法（兜底）
@@ -177,7 +177,7 @@ worktree 与 GitNexus 索引默认按「仓库@分支」各维护一份，跟随
 - **记录**：每次删除都写入 `~/.cache/elk-log-analysis/gc.log`。
 - **手动执行**：
   ```bash
-  python3 ~/.cc-switch/skills/elk-log-analysis/scripts/elk.py code-gc --dry-run
+  python3 ~/.claude/skills/elk-log-analysis/scripts/elk.py code-gc --dry-run
   ```
   去掉 `--dry-run` 才会真正删除；`--days` / `--exact-days` 可临时覆盖阈值。
 
