@@ -1,0 +1,4 @@
+# 构建上下文只需要 scripts/；尤其不能把 deploy/.env、deploy/config 中的凭据与 token 发给 docker daemon
+*
+!scripts/
+scripts/__pycache__

@@ -1,0 +1,7 @@
+.env
+config/envs.json
+config/tokens.json
+config/*.crt
+config/*.key
+config/*.pem
+data/

@@ -1,0 +1,7 @@
+{
+  "_comment": "复制为 tokens.json。每个成员一条，用 `python3 scripts/mcp_http.py gen-token <成员名>` 生成（只存 sha256，不存明文）。prod=true 才能查生产；admin=true 才能执行 elk_doctor fix=true；disabled=true 临时停用。修改后自动生效，无需重启。",
+  "tokens": [
+    {"name": "admin", "sha256": "替换为 gen-token 输出的 sha256", "prod": true, "admin": true},
+    {"name": "alice", "sha256": "替换为 gen-token 输出的 sha256", "prod": false, "admin": false}
+  ]
+}

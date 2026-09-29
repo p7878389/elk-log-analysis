@@ -1,0 +1,12 @@
+# 自动申请 Let's Encrypt 证书：ELK_DOMAIN 需解析到本机且 80/443 可从公网访问。
+# 纯内网没有公网域名时，把站点地址改成 ":443" 并加一行 "tls internal"（客户端需信任 Caddy 根证书），
+# 或者不用 Caddy，改用 .env 中的 ELK_HTTP_CERT/ELK_HTTP_KEY 让服务直接提供 HTTPS。
+{$ELK_DOMAIN} {
+	encode gzip
+	reverse_proxy elk-mcp:8765 {
+		# 长查询（大时间范围聚合）不被代理提前断开
+		transport http {
+			read_timeout 300s
+		}
+	}
+}

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS launchd。把路径改成实际位置后：
+     cp deploy/service/com.elk-mcp.plist ~/Library/LaunchAgents/
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.elk-mcp.plist
+     停止：launchctl bootout gui/$(id -u)/com.elk-mcp      日志：/tmp/elk-mcp.log -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.elk-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/opt/elk-log-analysis/scripts/mcp_http.py</string>
+    <string>--env-file</string>
+    <string>/opt/elk-log-analysis/deploy/.env</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- code_* 需要 git/gitnexus/node 在 PATH 中 -->
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/elk-mcp.log</string>
+  <key>StandardErrorPath</key><string>/tmp/elk-mcp.log</string>
+</dict>
+</plist>

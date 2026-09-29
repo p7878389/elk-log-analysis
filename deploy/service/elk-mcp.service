@@ -1,0 +1,22 @@
+# Linux systemd。假定仓库在 /opt/elk-log-analysis，并已按 .env.example 配好 deploy/.env（打开"原生部署"段）
+#   sudo useradd -r -m -d /var/lib/elk-mcp elk
+#   sudo cp deploy/service/elk-mcp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now elk-mcp
+#   journalctl -u elk-mcp -f
+[Unit]
+Description=ELK log MCP server (HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=elk
+WorkingDirectory=/opt/elk-log-analysis
+ExecStart=/usr/bin/python3 /opt/elk-log-analysis/scripts/mcp_http.py --env-file /opt/elk-log-analysis/deploy/.env
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

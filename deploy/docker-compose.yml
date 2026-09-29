@@ -1,0 +1,43 @@
+# 用法（在 deploy 目录下）：
+#   cp .env.example .env && cp config/envs.example.json config/envs.json && cp config/tokens.example.json config/tokens.json
+#   docker compose up -d --build                 # 仅日志查询
+#   ELK_IMAGE_TARGET=code docker compose up -d --build   # 含 code_* 源码分析（需挂载 /repos）
+#   docker compose --profile tls up -d --build   # 同时启动 Caddy 自动 HTTPS（需公网域名，见 Caddyfile）
+services:
+  elk-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: ${ELK_IMAGE_TARGET:-base}
+    image: elk-mcp:${ELK_IMAGE_TARGET:-base}
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # 默认只监听本机，由反向代理对外；内网直连可改为 "8765:8765"
+      - "${ELK_HTTP_PUBLISH:-127.0.0.1:8765}:8765"
+    # 容器不继承宿主机 /etc/hosts：若服务器靠 hosts 解析 Kibana 域名，在这里补上
+    # extra_hosts:
+    #   - "kibana-test.example.com:10.0.0.10"
+    #   - "kibana.example.com:10.0.0.10"
+    volumes:
+      - ./config:/config:ro          # envs.json / tokens.json，挂目录而非单文件，tokens 修改后自动生效
+      - elk-data:/data               # 调用日志、worktree、GitNexus 索引缓存
+      # code_* 需要：服务端的源码仓库目录（会执行 git fetch / worktree add，需可写）与拉代码用的 SSH key
+      # - /srv/repos:/repos
+      # - ~/.ssh/elk_deploy_key:/home/elk/.ssh/id_ed25519:ro
+      # - ~/.ssh/known_hosts:/home/elk/.ssh/known_hosts:ro
+
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2
+    restart: unless-stopped
+    env_file: .env
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [elk-mcp]
+
+volumes:
+  elk-data:
+  caddy-data:

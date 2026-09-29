@@ -1,0 +1,43 @@
+{
+  "_comment": "复制到 ~/.config/elk-log-analysis/envs.json 并 chmod 600。只在 MCP env 未设置 ELK_ENVIRONMENTS / ELK_ENVS 时使用。environments 为数组，每项一个环境，字段与 ELK_ENVIRONMENTS 相同；defaults 为全局默认；未配置的项由环境级别预设补齐。本文件中 password/api_key 只能写 keychain:<service>/<account> 或 env:<变量名>，禁止明文。",
+  "default_env": "test",
+  "fields": {
+    "timestamp": "@timestamp",
+    "message": "message",
+    "level": "level",
+    "service": "app_name",
+    "trace": "traceId",
+    "logger": "logger_name",
+    "host": "host.name",
+    "stack": "stack_trace"
+  },
+  "environments": [
+    {
+      "env": "test",
+      "url": "https://kibana-test.example.com",
+      "mode": "kibana",
+      "index": "clinic-test-*",
+      "username": "log_reader",
+      "password": "keychain:elk-log-analysis/test"
+    },
+    {
+      "env": "uat",
+      "tier": "staging",
+      "url": "https://kibana-test.example.com",
+      "mode": "kibana",
+      "index": "clinic-uat-*",
+      "username": "log_reader",
+      "password": "keychain:elk-log-analysis/test",
+      "branch": "release"
+    },
+    {
+      "env": "prod",
+      "url": "https://kibana.example.com",
+      "mode": "kibana",
+      "index": "clinic-prod-*",
+      "api_key": "keychain:elk-log-analysis/prod-apikey",
+      "max_size": 200,
+      "fields": { "service": "kubernetes.labels.app" }
+    }
+  ]
+}
