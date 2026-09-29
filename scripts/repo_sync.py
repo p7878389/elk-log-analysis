@@ -3,8 +3,7 @@
 
 环境变量：
   ELK_GITLAB_URL            GitLab 地址，如 https://gitlab.example.com（支持自建实例）
-  ELK_GITLAB_TOKEN          访问令牌，需 read_api + read_repository；只用于请求头，不写入磁盘
-  ELK_GITLAB_CA_CERT        自签/内部 CA 证书路径（可选）
+  认证（访问令牌 / OAuth 令牌 / 账号密码）与拉取协议（HTTPS / SSH）见 gitlab_auth.py
   ELK_GITLAB_GROUPS         只同步这些组（完整路径，逗号分隔，含子组）；不设则同步令牌所属账号是成员的全部项目
   ELK_GITLAB_EXCLUDE        排除的项目，按 path_with_namespace 通配，逗号分隔，如 sandbox/*,*/docs
   ELK_REPO_SYNC_DIR         clone 到哪个目录，默认 ELK_CODE_ROOT 的第一个目录
@@ -21,7 +20,6 @@ import fnmatch
 import json
 import os
 import shutil
-import ssl
 import subprocess
 import threading
 import time
@@ -33,6 +31,7 @@ from datetime import datetime
 
 import code_core as code
 import elk_core as core
+import gitlab_auth
 
 MANIFEST = ".elk-repo-sync.json"
 _RUN_LOCK = threading.Lock()  # 进程内：定时任务与手动触发不重叠
@@ -46,14 +45,13 @@ def _split(v):
 def load_sync_config(environ=None):
     """返回同步配置；未配置 GitLab 时返回 None。"""
     environ = os.environ if environ is None else environ
-    url = (environ.get("ELK_GITLAB_URL") or "").rstrip("/")
-    if not url:
+    auth = gitlab_auth.load(environ)
+    if auth is None:
         return None
     ccfg = code.load_code_config(environ)
     return {
-        "url": url,
-        "token": environ.get("ELK_GITLAB_TOKEN") or "",
-        "ca": os.path.expanduser(environ.get("ELK_GITLAB_CA_CERT") or ""),
+        "url": auth["url"],
+        "auth": auth,
         "groups": _split(environ.get("ELK_GITLAB_GROUPS")),
         "exclude": _split(environ.get("ELK_GITLAB_EXCLUDE")),
         "dir": ccfg["sync_dir"],
@@ -89,17 +87,22 @@ def _log(scfg, msg):
 def _api(scfg, path, params=None):
     """GET /api/v4<path>，返回 (数据, 下一页页码或 None)。令牌只放在请求头，错误信息中不含令牌。"""
     qs = "?" + urllib.parse.urlencode(params) if params else ""
-    req = urllib.request.Request(scfg["url"] + "/api/v4" + path + qs,
-                                 headers={"PRIVATE-TOKEN": scfg["token"], "Accept": "application/json"})
-    ctx = ssl.create_default_context(cafile=scfg["ca"] or None)
-    try:
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
-            return json.loads(r.read().decode("utf-8")), (r.headers.get("X-Next-Page") or None)
-    except urllib.error.HTTPError as e:
-        hint = {401: "令牌无效或已过期", 403: "令牌缺少 read_api 权限", 404: "组或路径不存在（或无权限）"}.get(e.code, "")
-        raise core.ElkError("GitLab API %s 返回 %s %s" % (path, e.code, hint or e.reason))
-    except (urllib.error.URLError, OSError) as e:
-        raise core.ElkError("无法访问 GitLab（%s）：%s" % (scfg["url"], getattr(e, "reason", e)))
+    auth = scfg["auth"]
+    for attempt in (1, 2):
+        req = urllib.request.Request(scfg["url"] + "/api/v4" + path + qs,
+                                     headers=dict(gitlab_auth.api_headers(auth), Accept="application/json"))
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=gitlab_auth._ssl(auth)) as r:
+                return json.loads(r.read().decode("utf-8")), (r.headers.get("X-Next-Page") or None)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and auth["mode"] == "password" and attempt == 1:
+                gitlab_auth.invalidate(auth)  # 临时令牌提前失效：重新换取后重试一次
+                continue
+            hint = {401: "凭据无效或已过期", 403: "凭据缺少 read_api 权限",
+                    404: "组或路径不存在（或无权限）"}.get(e.code, "")
+            raise core.ElkError("GitLab API %s 返回 %s %s" % (path, e.code, hint or e.reason))
+        except (urllib.error.URLError, OSError) as e:
+            raise core.ElkError("无法访问 GitLab（%s）：%s" % (scfg["url"], getattr(e, "reason", e)))
 
 
 def _paged(scfg, path, params):
@@ -108,6 +111,15 @@ def _paged(scfg, path, params):
         data, page = _api(scfg, path, dict(params, page=page, per_page=100))
         out.extend(data)
     return out
+
+
+def check_login(scfg):
+    """验证凭据：返回 GitLab 上的用户名。"""
+    bad = gitlab_auth.problem(scfg["auth"])
+    if bad:
+        raise core.ElkError(bad)
+    user, _ = _api(scfg, "/user")
+    return user.get("username") or user.get("name") or "?"
 
 
 def list_projects(scfg):
@@ -129,7 +141,7 @@ def list_projects(scfg):
             continue
         seen.add(p["id"])
         out.append({"id": p["id"], "path": p["path"], "path_with_namespace": pwn,
-                    "url": p["http_url_to_repo"], "default_branch": p.get("default_branch") or ""})
+                    "url": gitlab_auth.clone_url(scfg["auth"], p), "default_branch": p.get("default_branch") or ""})
     return out
 
 
@@ -224,6 +236,8 @@ def _sync_one(scfg, p, manifest):
         elif not code._is_repo(path):
             return None, "目录已存在但不是 git 仓库：%s" % path
         else:
+            if managed and _origin(path) != p["url"]:
+                code.git(path, "remote", "set-url", "origin", p["url"], check=False)
             r = code.git(path, "fetch", "--prune", "--no-tags", "origin", timeout=900, check=False)
             if r.returncode != 0:
                 return None, _git_err(r)
@@ -312,8 +326,9 @@ def prebuild_indexes(scfg, repo_dirs, report):
 def run_sync(scfg, index=True, progress=None):
     """同步一次并写状态文件，返回报告。跨进程互斥：CLI 与服务进程不会同时同步。"""
     say = progress or (lambda m: None)
-    if not scfg["token"]:
-        raise core.ElkError("未配置 ELK_GITLAB_TOKEN")
+    bad = gitlab_auth.problem(scfg["auth"])
+    if bad:
+        raise core.ElkError(bad)
     if not scfg["dir"]:
         raise core.ElkError("未配置同步目录：请设置 ELK_CODE_ROOT 或 ELK_REPO_SYNC_DIR")
     if not _RUN_LOCK.acquire(blocking=False):
@@ -333,6 +348,7 @@ def _run_sync(scfg, index, say):
               "indexed": [], "index_fresh": 0, "index_failed": [], "index_skipped": None}
     _write_status(scfg, report)
     try:
+        report["user"] = check_login(scfg)
         projects = list_projects(scfg)
     except core.ElkError as e:
         report.update(running=False, error=str(e), finished=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -342,7 +358,7 @@ def _run_sync(scfg, index, say):
     manifest = _load_manifest(scfg)
     plan_dirs(scfg, projects, manifest)
     report["total"] = len(projects)
-    say(_log(scfg, "开始同步 %d 个项目 → %s" % (len(projects), scfg["dir"])))
+    say(_log(scfg, "以 %s 登录，开始同步 %d 个项目 → %s" % (report["user"], len(projects), scfg["dir"])))
     lock = threading.Lock()
 
     def one(p):
@@ -451,8 +467,9 @@ def describe(scfg, grep=None):
         return ("未配置 GitLab 仓库同步。在服务端 .env 中设置 ELK_GITLAB_URL 与 ELK_GITLAB_TOKEN"
                 "（read_api + read_repository）后，会定时把有权限的仓库同步到代码目录。")
     lines = ["# GitLab 仓库同步",
-             "GitLab: %s  范围: %s%s" % (scfg["url"], "组 " + ",".join(scfg["groups"]) if scfg["groups"]
-                                          else "令牌账号可访问的全部项目",
+             "GitLab: %s（%s）" % (scfg["url"], gitlab_auth.problem(scfg["auth"]) or gitlab_auth.describe(scfg["auth"])),
+             "范围: %s%s" % ("组 " + ",".join(scfg["groups"]) if scfg["groups"]
+                                          else "账号可访问的全部项目",
                                           "  排除: " + ",".join(scfg["exclude"]) if scfg["exclude"] else ""),
              "目录: %s  间隔: %s  预建索引: %s" % (
                  scfg["dir"], "%d 小时" % (scfg["interval"] // 3600) if scfg["interval"] >= 3600
@@ -467,8 +484,9 @@ def describe(scfg, grep=None):
         elif st.get("error"):
             lines.append("状态: 上次同步失败（%s）：%s" % (st.get("finished"), st["error"]))
         else:
-            lines.append("上次同步: %s（耗时 %ss）  共 %s 个项目，新增 %d，更新 %d，失败 %d%s" % (
-                st.get("finished"), st.get("seconds", "-"), st.get("total"), len(st.get("cloned", [])),
+            lines.append("上次同步: %s（耗时 %ss，账号 %s）  共 %s 个项目，新增 %d，更新 %d，失败 %d%s" % (
+                st.get("finished"), st.get("seconds", "-"), st.get("user", "-"), st.get("total"),
+                len(st.get("cloned", [])),
                 st.get("updated", 0), len(st.get("failed", [])),
                 "  下次: %s" % st["next_run"] if st.get("next_run") else ""))
             if st.get("indexed") or st.get("index_failed") or st.get("index_fresh"):

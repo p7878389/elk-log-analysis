@@ -361,12 +361,13 @@ def main():
         % (scheme, HOST, PORT, PATH, "关闭" if NO_AUTH else "Bearer token", ",".join(sorted(DISABLED)) or "无"))
     scfg = mcp.repo_sync.load_sync_config()
     if scfg:
-        if not scfg["token"]:
-            log("已配置 ELK_GITLAB_URL 但缺少 ELK_GITLAB_TOKEN，仓库同步未启用")
+        bad = mcp.repo_sync.gitlab_auth.problem(scfg["auth"])
+        if bad:
+            log("GitLab 仓库同步未启用：%s" % bad)
         else:
             mcp.repo_sync.start_scheduler(scfg, log)
-            log("GitLab 仓库同步已启用：%s → %s，%s%s" % (
-                scfg["url"], scfg["dir"], "每 %d 秒" % scfg["interval"] if scfg["interval"] else "仅手动触发",
+            log("GitLab 仓库同步已启用：%s（%s）→ %s，%s%s" % (
+                scfg["url"], mcp.repo_sync.gitlab_auth.describe(scfg["auth"]), scfg["dir"], "每 %d 秒" % scfg["interval"] if scfg["interval"] else "仅手动触发",
                 "，同步后预建 %s 分支索引" % ",".join(scfg["index_envs"]) if scfg["index_envs"] else ""))
     if GITNEXUS:
         start_gitnexus()

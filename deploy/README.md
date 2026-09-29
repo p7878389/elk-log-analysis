@@ -134,15 +134,27 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 
 ### 配置
 
-1. **准备访问令牌**：在 GitLab 中创建令牌，权限选 `read_api` + `read_repository`。
-2. **填写 `.env`**（完整选项见 `.env.example` 的「GitLab 仓库定时同步」段）：
+1. **选择认证方式**，在 `.env` 中填写对应的凭据（各方式的完整写法见 `.env.example`）：
+
+   | 方式 | `.env` 配置 | 说明 |
+   |---|---|---|
+   | **访问令牌**（推荐） | `ELK_GITLAB_TOKEN` | 个人、组或项目令牌都可以，权限选 `read_api` + `read_repository`；可设有效期，随时吊销 |
+   | **账号密码** | `ELK_GITLAB_USERNAME` + `ELK_GITLAB_PASSWORD` | GitLab API 不接受密码直接访问，服务会先用 OAuth 密码模式换取临时令牌，过期前自动续期。**账号开启了双因素认证、或只能通过 SSO 登录时不可用**。较新版本的 GitLab 可能关闭了密码授权，或要求提供 OAuth 应用（`ELK_GITLAB_CLIENT_ID/SECRET`），无法满足时，会提示改用令牌 |
+   | **OAuth 令牌** | `ELK_GITLAB_AUTH=oauth` + `ELK_GITLAB_TOKEN` | 适合已有统一签发令牌的系统；令牌过期需要外部更新 |
+
+   - **拉取协议**：默认用 HTTPS，凭据同上。设置 `ELK_GITLAB_GIT_PROTOCOL=ssh` 和 `ELK_GITLAB_SSH_KEY` 后改用 SSH 拉取；列项目的 API 仍然用上面的凭据。私钥放在 `config/` 下，属主要改为 10001，权限设为 600。切换协议后，已同步仓库的 origin 会自动改写。
+   - **凭据放在文件里**：每个凭据变量都可以改成 `<变量>_FILE` 指向一个文件，兼容 Docker secrets。
+2. **填写同步范围等其他选项**（可选）：
    ```ini
    ELK_GITLAB_URL=https://gitlab.example.com
-   ELK_GITLAB_TOKEN=glpat-xxxxxxxx
-   ELK_GITLAB_GROUPS=backend          # 可选，只同步这些组（含子组）
-   ELK_REPO_SYNC_INDEX=prod           # 可选，同步后预建 prod 分支索引
+   ELK_GITLAB_GROUPS=backend          # 只同步这些组（含子组）
+   ELK_REPO_SYNC_INDEX=prod           # 同步后预建 prod 分支索引
    ```
-3. **启动**：执行 `ELK_IMAGE_TARGET=code docker compose up -d --build`。服务启动约 15 秒后开始第一次同步，之后每 6 小时同步一次。
+3. **验证凭据**，确认能登录再启动：
+   ```bash
+   docker compose run --rm elk-mcp python /app/scripts/elk.py repo-sync --check
+   ```
+4. **启动**：执行 `ELK_IMAGE_TARGET=code docker compose up -d --build`。服务启动约 15 秒后开始第一次同步，之后每 6 小时同步一次。
 
 ### 同步规则
 
@@ -154,7 +166,7 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 | 本脚本 clone 的仓库 | 每次同步都强制对齐到远程默认分支 |
 | `/repos` 下已有的同一仓库 | 只执行 fetch，不改动其工作区 |
 | 已无权限或已删除的项目 | 只在状态中标记，**不自动删除**，需要时手动删除目录 |
-| 令牌安全 | 通过环境变量注入 git，只发给 `ELK_GITLAB_URL` 这个地址；不写入 `.git/config`，也不出现在命令行参数和日志中 |
+| 凭据安全 | 令牌、密码和换来的临时令牌只存在于服务进程的内存里。通过环境变量传给 git，只发给 `ELK_GITLAB_URL` 这个地址；不写入 `.git/config` 和 remote URL，也不出现在命令行参数和日志中。换令牌失败后，5 分钟内不会重试，避免在 GitLab 连不上时反复卡住 |
 
 ### 预建索引
 
@@ -174,6 +186,7 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 |---|---|
 | 查看同步状态 | 在客户端让模型调用 `code_repos`；或执行 `docker compose exec elk-mcp python /app/scripts/elk.py repo-sync --status` |
 | 立即同步 | 管理员调用 `code_repos` 并传入 `sync=true`；或执行 `docker compose exec elk-mcp python /app/scripts/elk.py repo-sync` |
+| 验证凭据 | `docker compose exec elk-mcp python /app/scripts/elk.py repo-sync --check` |
 | 预览同步范围 | `docker compose exec elk-mcp python /app/scripts/elk.py repo-sync --dry-run` |
 | 同步日志 | 容器内 `/data/cache/repo-sync/sync.log`；GitNexus 服务日志在 `/data/cache/gitnexus-mcp.log` |
 | 原生部署 | `python3 scripts/elk.py --env-file deploy/.env repo-sync`；定时同步由 `mcp_http.py` 内置，不需要另配 cron |

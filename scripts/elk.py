@@ -110,6 +110,9 @@ def run(args):
         scfg = repo_sync.load_sync_config()
         if args.status or scfg is None:
             return repo_sync.describe(scfg)
+        if args.check:
+            return "✔ 已登录 GitLab：%s（%s）" % (repo_sync.check_login(scfg),
+                                               repo_sync.gitlab_auth.describe(scfg["auth"]))
         if args.no_index:
             scfg["index_envs"] = []
         if args.dry_run:
@@ -225,6 +228,7 @@ def main():
 
     p = sub.add_parser("repo-sync", help="从 GitLab 同步有权限的仓库（ELK_GITLAB_URL / ELK_GITLAB_TOKEN）")
     p.add_argument("--status", action="store_true", help="只查看同步状态与已同步仓库")
+    p.add_argument("--check", action="store_true", help="只验证 GitLab 凭据能否登录")
     p.add_argument("--dry-run", action="store_true", help="只列出将同步的项目与本地目录")
     p.add_argument("--no-index", action="store_true", help="本次不预建 GitNexus 索引")
 
