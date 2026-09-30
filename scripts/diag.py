@@ -366,17 +366,21 @@ def check_tools(r, ctx):
     g = subprocess.run(["git", "--version"], capture_output=True, text=True)
     (r.ok if g.returncode == 0 else r.failed)("git：%s" % (g.stdout.strip() or g.stderr.strip()))
     ccfg = ctx.get("ccfg") or code.load_code_config()
-    gn = ccfg["gitnexus"]
-    if not os.path.exists(gn):
-        r.warn("未找到 gitnexus（%s），code_prepare 无法建索引" % gn,
-               action="安装 gitnexus（npm i -g gitnexus），或在 ELK_CODE_GITNEXUS 中指定路径")
+    gn = code.gitnexus(ccfg, refresh=True)  # 自检总是重新检测，并刷新缓存
+    if gn.get("error"):
+        r.warn("%s，code_prepare 无法建索引" % gn["error"],
+               action="安装 gitnexus（npm i -g gitnexus），或在 ELK_CODE_GITNEXUS 中指定可执行文件 / 安装目录"
+                      "（如 ~/.nvm/versions/node/v22.19.0 或 %APPDATA%\\npm）")
     else:
-        v = subprocess.run([gn, "--version"], capture_output=True, text=True, timeout=30, env=code._gitnexus_env(ccfg))
-        if v.returncode == 0:
-            r.ok("gitnexus：%s（%s）" % (v.stdout.strip(), gn))
-        else:
+        v = subprocess.run(gn["argv"] + ["--version"], capture_output=True, text=True, timeout=30,
+                           env=code._gitnexus_env(ccfg))
+        if v.returncode != 0:
             r.failed("gitnexus 无法运行：%s" % (v.stderr or v.stdout).strip()[:200],
-                     action="检查 node 是否安装、gitnexus 是否完整")
+                     action="检查 node 版本是否满足要求、gitnexus 是否完整；可用 ELK_CODE_NODE 指定 node")
+        elif gn.get("warning"):
+            r.warn(code.gitnexus_bin.describe(gn), action="按提示更新 ELK_CODE_GITNEXUS / ELK_CODE_NODE，或升级 node")
+        else:
+            r.ok(code.gitnexus_bin.describe(gn))
     probe = os.path.join(code._cache_dir(ccfg), ".doctor-probe")
     with open(probe, "w"):
         pass
@@ -478,7 +482,7 @@ def check_cache(r, ctx):
     for p in dangling:
         r.warn("GitNexus 注册表中有失效项：%s" % p,
                fix=("gitnexus remove -f", lambda p=p: subprocess.run(
-                   [ccfg["gitnexus"], "remove", "-f", p], capture_output=True, text=True, timeout=60,
+                   code.gitnexus_argv(ccfg, "remove", "-f", p), capture_output=True, text=True, timeout=60,
                    env=code._gitnexus_env(ccfg), check=True) and None))
     # 主仓库中指向缓存目录但目录已丢失的 worktree 登记（只注销这一条，不做全局 prune）
     if ccfg["roots"]:

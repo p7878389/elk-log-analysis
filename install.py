@@ -13,6 +13,8 @@ clone 仓库后运行，不带参数时逐项询问：
    --mode local   本机 stdio 运行 scripts/mcp_server.py，直接连 ELK（环境配置见 references/mcp-config.md）
    --mode remote  连接团队部署的 HTTP 服务（--url + 个人 token）；服务端开启了 GitNexus 转发时，
                   同时注册 gitnexus-remote（查询服务端预建的调用链/影响面索引）
+   本地模式会在当前终端中检测 gitnexus 与 node（终端的 PATH 最完整），把路径写进 MCP 配置，
+   这样 GUI 客户端启动 MCP 时也能找到；也可用 --gitnexus / --node 手动指定
 3. 权限：skill 目录 755/644；含凭据的文件（客户端配置、envs.json、备份）只有当前用户可读写
    （Unix 600/700；Windows 去掉继承的 ACL，只授权当前用户与 SYSTEM）
 """
@@ -43,6 +45,8 @@ if WINDOWS:  # 控制台编码不是 UTF-8 时，中文输出不因编码错误�
             pass
 
 SRC = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(SRC, "scripts"))
+import gitnexus_bin  # noqa: E402  仅标准库，与 MCP 运行时使用同一套检测逻辑
 HOME = os.path.expanduser("~")
 SKILL = "elk-log-analysis"
 PAYLOAD = ("SKILL.md", "LICENSE", "references", "scripts")
@@ -264,8 +268,18 @@ def python_exe():
 def mcp_entry(args, scripts_dir):
     if args.mode == "local":
         e = {"type": "stdio", "command": python_exe(), "args": [os.path.join(scripts_dir, "mcp_server.py")]}
+        env = {}
         if args.code_root:
-            e["env"] = {"ELK_CODE_ROOT": args.code_root}
+            env["ELK_CODE_ROOT"] = args.code_root
+        gn = getattr(args, "gitnexus_info", None)
+        if gn and not gn.get("error"):
+            # 记录可执行文件与 node：GUI 客户端启动 MCP 时 PATH 不全，也能直接找到。
+            # 路径日后失效（如切换了 nvm 版本）时，运行时会自动改用检测到的位置并在 elk_doctor 中提示
+            env["ELK_CODE_GITNEXUS"] = gn["launcher"]
+            if gn.get("node"):
+                env["ELK_CODE_NODE"] = gn["node"]
+        if env:
+            e["env"] = env
         return e
     auth = "Bearer ${ELK_MCP_TOKEN}" if args.token_store == "env" else "Bearer " + args.token
     return {"type": "http", "url": args.url, "headers": {"Authorization": auth}}
@@ -429,8 +443,18 @@ def check_local(entry):
         say("  ! MCP 可以启动，但环境配置还不可用：\n    " + text.replace("\n", "\n    ")[:600])
     else:
         say("  ✔ 本地 MCP 正常，已配置的环境：\n    " + text.replace("\n", "\n    ")[:800])
-    for tool, need in (("git", "code_* 源码定位"), ("gitnexus", "code_prepare 索引（可选）")):
-        say("  %s %s：%s" % ("✔" if shutil.which(tool) else "·", tool, "已安装" if shutil.which(tool) else "未找到，影响 " + need))
+    say("  %s git：%s" % ("✔" if shutil.which("git") else "·",
+                          "已安装" if shutil.which("git") else "未找到，影响 code_* 源码定位"))
+    env = entry.get("env", {})
+    if env.get("ELK_CODE_GITNEXUS"):
+        info = gitnexus_bin.locate(env["ELK_CODE_GITNEXUS"], env.get("ELK_CODE_NODE", ""))
+        r = subprocess.run(info["argv"] + ["--version"], capture_output=True, text=True, timeout=60,
+                           env=gitnexus_bin.run_env(info)) if info.get("argv") else None
+        ok = r is not None and r.returncode == 0
+        say("  %s gitnexus：%s" % ("✔" if ok else "✘", gitnexus_bin.describe(info) if ok
+                                   else "无法运行：%s" % ((r.stderr or r.stdout).strip()[:200] if r else info["error"])))
+    else:
+        say("  · gitnexus：未配置，code_prepare 调用链索引不可用（安装后重新运行本脚本即可）")
 
 
 def gitnexus_url(url):
@@ -534,6 +558,36 @@ def resolve_args(args):
     else:
         if args.code_root is None:
             args.code_root = ask("源码根目录 ELK_CODE_ROOT（code_* 用，多个逗号分隔，留空跳过）", "")
+        args.gitnexus_info = detect_gitnexus(args)
+
+
+def detect_gitnexus(args):
+    """在当前终端检测 gitnexus；检测不到时交互询问安装位置。返回检测结果（可能带 error）。"""
+    if args.no_gitnexus_detect:
+        return None
+    step("检测 gitnexus（code_prepare 建调用链索引用，可选）")
+    def find(path):
+        info = gitnexus_bin.locate(path or "", args.node or "")
+        if path and info.get("source") != "ELK_CODE_GITNEXUS":
+            # 安装时明确指定的路径无效：报错，不像运行时那样悄悄回退到自动检测
+            return {"error": "%s 下没有找到 gitnexus（可填可执行文件、npm 全局目录、nvm 版本目录或 gitnexus 包目录）"
+                             % path, "argv": None}
+        return info
+
+    info = find(args.gitnexus)
+    if args.gitnexus and info.get("error") and not interactive():
+        sys.exit("--gitnexus：" + info["error"])
+    while info.get("error"):
+        say("  · " + info["error"])
+        path = ask("  gitnexus 可执行文件或安装目录（如 ~/.nvm/versions/node/v22.19.0，留空跳过）", "")
+        if not path:
+            say("  已跳过：code_locate 仍可用，只是不能建调用链索引；安装 gitnexus 后重新运行本脚本即可")
+            return info
+        info = find(path)
+    say("  ✔ " + gitnexus_bin.describe(info))
+    if info.get("warning"):
+        say("  ! 建议：升级 node，或用 --node 指定满足要求的 node")
+    return info
 
 
 def uninstall(args, clients):
@@ -580,6 +634,10 @@ def main():
     p.add_argument("--token-store", choices=["config", "env"], default="config",
                    help="config（默认）：token 写入客户端配置（仅本人可读）；env：配置中引用环境变量 ELK_MCP_TOKEN")
     p.add_argument("--code-root", help="本地模式的源码根目录 ELK_CODE_ROOT，多个用逗号分隔")
+    p.add_argument("--gitnexus", help="本地模式：gitnexus 可执行文件或安装目录（npm 全局目录、nvm 版本目录、"
+                                      "gitnexus 包目录均可），不填则自动检测")
+    p.add_argument("--node", help="本地模式：运行 gitnexus 的 node（需满足 gitnexus 的版本要求），不填则自动选择")
+    p.add_argument("--no-gitnexus-detect", action="store_true", help="本地模式：不检测、不配置 gitnexus")
     p.add_argument("--clients", help="要配置的客户端，逗号分隔：claude,codex（默认自动检测）")
     p.add_argument("--name", default="elk", help="MCP 名称，默认 elk")
     p.add_argument("--gitnexus-name", default="gitnexus-remote",

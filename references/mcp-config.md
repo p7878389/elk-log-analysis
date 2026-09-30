@@ -163,7 +163,8 @@ ELK_PROD_MAX_SIZE=2000
 | `ELK_CODE_GC_DAYS` | 分支 worktree（`<仓库>@<分支>`）闲置多少天后自动删除（连同 GitNexus 索引）；`0` 关闭 | 默认 `10` |
 | `ELK_CODE_GC_EXACT_DAYS` | 按 commit 的 worktree（`<仓库>@<commit>`，exact 模式产生）闲置多少天后自动删除；`0` 关闭 | 默认 `3` |
 | `ELK_CODE_AUTO_INDEX` | `code_prepare` 时是否自动后台构建/增量更新 GitNexus 索引 | 默认 `true` |
-| `ELK_CODE_GITNEXUS` | gitnexus 可执行文件 | 默认 PATH 中的 `gitnexus`，其次 `/opt/homebrew/bin/gitnexus` |
+| `ELK_CODE_GITNEXUS` | gitnexus 的**可执行文件或安装目录**，可以填 npm 全局目录、nvm 版本目录或 gitnexus 包目录。填的路径失效时（比如切换了 nvm 版本），会自动改用检测到的位置，并在 `elk_doctor` 中提示 | 不填则自动检测，见下文 |
+| `ELK_CODE_NODE` | 运行 gitnexus 的 node。gitnexus 要求 node ≥22.18 | 不填则优先用 gitnexus 同目录的 node，再选满足版本要求的 |
 
 worktree 与 GitNexus 索引默认按「仓库@分支」各维护一份，跟随分支 HEAD。`exact=true` 时按「仓库@commit」额外建立（闲置 3 天后自动清理）。每份索引约 0.5G（order-platform 实测 568M）。
 
@@ -199,6 +200,22 @@ git -C ~/code/<仓库> worktree remove --force ~/.cache/elk-log-analysis/worktre
 security add-generic-password -U -s elk-log-analysis -a prod -w
 ```
 然后在 elk 对象（或 envs.json）的环境项中写 `"password": "keychain:elk-log-analysis/prod"`；MCP env 写法则为 `ELK_PASSWORD=keychain:elk-log-analysis/default`（全局）或 `ELK_PROD_PASSWORD=keychain:elk-log-analysis/prod`（只给生产单独配）。
+
+### gitnexus 自动检测
+
+MCP 进程常常由 GUI 客户端启动（Claude Code 桌面版、Cursor 等），这时 `PATH` 里没有你在终端配置的 nvm、fnm、volta 等目录，直接查找 `gitnexus` 经常找不到。所以没有填 `ELK_CODE_GITNEXUS` 时，会按以下顺序自动检测，结果缓存在 `<缓存目录>/gitnexus.json`：
+
+1. 上次检测的结果（文件仍存在就直接用）
+2. 当前 `PATH`
+3. 常见安装位置：
+   - macOS/Linux：Homebrew、`/usr/local`、`~/.npm-global`、nvm、fnm、volta、pnpm、bun、asdf、mise
+   - Windows：`%APPDATA%\npm`、pnpm、Volta、nvm-windows、scoop
+4. `npm prefix -g` 返回的 npm 全局目录
+5. 登录 shell 的 `PATH`：执行 `$SHELL -lic`，能找到只在 `.zshrc` / `.bashrc` 里配置的安装位置
+
+运行时优先使用 `<node> <gitnexus 包>/dist/cli/index.js` 的方式：显式指定 node，不依赖 `PATH` 和文件开头的 node 声明，在 Windows 上也不需要经过 `.cmd` 包装脚本。
+
+**安装脚本**（本地模式）会在你的终端里检测一次，把 `ELK_CODE_GITNEXUS` 和 `ELK_CODE_NODE` 写进 MCP 配置；也可以用 `--gitnexus`、`--node` 手动指定。`elk_doctor` 每次都会重新检测，显示使用的位置、来源和 node 版本。
 
 ## GitLab 仓库同步（服务端）
 

@@ -288,7 +288,7 @@ def _run_index(ccfg, wt, name, sha, timeout):
     """同步地建索引（逐个进行，避免几十个仓库同时建索引压垮机器）；登记任务文件，期间 code_prepare 会看到“构建中”。"""
     log = os.path.join(code._cache_dir(ccfg, "index"), name + ".log")
     with open(log, "w", encoding="utf-8") as out:
-        proc = subprocess.Popen([ccfg["gitnexus"], "analyze", "--index-only", "--name", name, wt], cwd=wt,
+        proc = subprocess.Popen(code.gitnexus_argv(ccfg, "analyze", "--index-only", "--name", name, wt), cwd=wt,
                                 env=code._gitnexus_env(ccfg), stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL)
         with open(code._index_file(ccfg, name), "w", encoding="utf-8") as f:
@@ -307,8 +307,9 @@ def prebuild_indexes(scfg, repo_dirs, report):
     if os.name == "nt":
         report["index_skipped"] = "原生 Windows 不支持建索引"
         return
-    if not os.path.exists(ccfg["gitnexus"]):
-        report["index_skipped"] = "未找到 gitnexus（%s）" % ccfg["gitnexus"]
+    gn = code.gitnexus(ccfg)
+    if gn.get("error"):
+        report["index_skipped"] = gn["error"]
         return
     conf = core.load_config()
     envs = []

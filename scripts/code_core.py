@@ -23,6 +23,7 @@ except ImportError:  # Windows
 
 import elk_core as core
 import gitlab_auth
+import gitnexus_bin
 
 # 环境名 → 候选分支（逗号分隔，按优先级；多个同时存在时优先 origin/HEAD，其次最近提交）
 DEFAULT_BRANCHES = {"dev": "dev", "test": "beta", "beta": "beta",
@@ -54,7 +55,7 @@ def load_code_config(environ=None):
     """ELK_CODE_ROOT 代码根目录（多个用逗号或冒号分隔；每项可以是仓库的父目录，也可以直接是仓库）；ELK_CODE_BRANCHES 环境→分支(JSON)；ELK_CODE_SERVICE_MAP 服务→仓库[/模块](JSON)；
     ELK_CODE_CACHE 缓存目录；ELK_CODE_FETCH_TTL fetch 节流秒数；ELK_CODE_LEASE worktree 使用中不推进的秒数；
     ELK_CODE_GC_DAYS / ELK_CODE_GC_EXACT_DAYS 分支/按 commit 的 worktree 闲置多少天后清理（0 关闭）；ELK_CODE_AUTO_INDEX 是否自动建索引；
-    ELK_CODE_GITNEXUS gitnexus 可执行文件。"""
+    ELK_CODE_GITNEXUS gitnexus 可执行文件或安装目录（不设则自动检测）；ELK_CODE_NODE 运行 gitnexus 的 node。"""
     environ = os.environ if environ is None else environ
     # 分隔符：逗号、换行、系统路径分隔符（Windows 为 ; 以免拆开 C:\ 盘符）
     roots = [os.path.expanduser(r.strip())
@@ -79,8 +80,8 @@ def load_code_config(environ=None):
         "gc_days": float(environ.get("ELK_CODE_GC_DAYS") or 10),
         "gc_exact_days": float(environ.get("ELK_CODE_GC_EXACT_DAYS") or 3),
         "auto_index": core._bool(environ.get("ELK_CODE_AUTO_INDEX"), True),
-        "gitnexus": (environ.get("ELK_CODE_GITNEXUS") or shutil.which("gitnexus")
-                     or "/opt/homebrew/bin/gitnexus"),
+        "gitnexus_spec": environ.get("ELK_CODE_GITNEXUS") or "",
+        "gitnexus_node": environ.get("ELK_CODE_NODE") or "",
     }
 
 
@@ -580,26 +581,35 @@ def _log_succeeded(log):
         return False
 
 
+def gitnexus(cfg, refresh=False):
+    """定位 gitnexus 与 node（见 gitnexus_bin）：进程内缓存 10 分钟，自动检测结果另存到缓存目录。"""
+    key = ("gitnexus", cfg["gitnexus_spec"], cfg["gitnexus_node"])
+    if refresh:
+        _MEMO.pop(key, None)
+    return _memo(key, 600, lambda: gitnexus_bin.locate(cfg["gitnexus_spec"], cfg["gitnexus_node"],
+                                                       cfg["cache"], refresh))
+
+
+def gitnexus_argv(cfg, *args):
+    info = gitnexus(cfg)
+    if info.get("error"):
+        raise core.ElkError(info["error"])
+    return info["argv"] + list(args)
+
+
 def _gitnexus_env(cfg):
-    """gitnexus 是 node 脚本：MCP 进程的 PATH 可能不含 node，补上 gitnexus 所在目录与 Homebrew 目录。"""
-    gn = cfg["gitnexus"]
-    env = dict(os.environ)
-    env["PATH"] = os.pathsep.join([os.path.dirname(os.path.realpath(gn)), os.path.dirname(gn),
-                                   "/opt/homebrew/bin", "/usr/local/bin", env.get("PATH", "")])
-    return env
+    info = gitnexus(cfg)
+    return dict(os.environ) if info.get("error") else gitnexus_bin.run_env(info)
 
 
 def start_index(cfg, wt, name, commit):
-    gn = cfg["gitnexus"]
     if os.name == "nt":
         raise core.ElkError("原生 Windows 部署不支持后台构建 GitNexus 索引，请改用 Docker 或 WSL 部署")
-    if not os.path.exists(gn):
-        raise core.ElkError("未找到 gitnexus（%s），可在 ELK_CODE_GITNEXUS 中指定路径" % gn)
+    cmd = gitnexus_argv(cfg, "analyze", "--index-only", "--name", name, wt)
     log = os.path.join(_cache_dir(cfg, "index"), name + ".log")
     env = _gitnexus_env(cfg)
     # 经 sh 后台启动：进程脱离 MCP 进程组，不留僵尸，MCP 重启也不会中断索引
     script = 'log="$1"; shift; nohup "$@" >"$log" 2>&1 </dev/null & echo $!'
-    cmd = [gn, "analyze", "--index-only", "--name", name, wt]
     r = subprocess.run(["/bin/sh", "-c", script, "sh", log] + cmd, cwd=wt, env=env,
                        capture_output=True, text=True, timeout=15, start_new_session=True)
     pid = int(r.stdout.strip().splitlines()[-1])
@@ -701,8 +711,8 @@ def _remove_worktree(cfg, wt, name):
     if os.path.dirname(os.path.realpath(wt)) != root:
         raise core.ElkError("拒绝删除缓存目录之外的路径: %s" % wt)
     steps = []
-    if os.path.exists(os.path.join(wt, ".gitnexus")) and os.path.exists(cfg["gitnexus"]):
-        r = subprocess.run([cfg["gitnexus"], "remove", "-f", wt], capture_output=True, text=True,
+    if os.path.exists(os.path.join(wt, ".gitnexus")) and not gitnexus(cfg).get("error"):
+        r = subprocess.run(gitnexus_argv(cfg, "remove", "-f", wt), capture_output=True, text=True,
                            timeout=120, env=_gitnexus_env(cfg))
         steps.append("gitnexus remove=%s" % ("ok" if r.returncode == 0 else "失败:" + (r.stderr or r.stdout).strip()[:120]))
     common = None

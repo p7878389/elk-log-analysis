@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 如果服务端开启了 GitNexus，远程模式会一并注册 `gitnexus-remote`，用来直接查询服务端预建的调用链和影响面索引，本机不需要 clone 任何代码。
 
-远程模式在**写入任何配置之前**会先验证 token，token 无效时直接退出，不做任何改动。本地模式会从模板生成 `~/.config/elk-log-analysis/envs.json`，并提示凭据的存放方式：macOS 放钥匙串，Windows 和 Linux 放环境变量。配置项说明见 [references/mcp-config.md](references/mcp-config.md)。
+远程模式在**写入任何配置之前**会先验证 token，token 无效时直接退出，不做任何改动。本地模式会在当前终端里检测 gitnexus 和 node，并把路径写进 MCP 配置。这样即使从 GUI 客户端启动 MCP、`PATH` 不完整，也能找到它们，nvm、fnm、volta、Homebrew、Windows 的 npm 等安装方式都能识别。本地模式还会从模板生成 `~/.config/elk-log-analysis/envs.json`，并提示凭据的存放方式：macOS 放钥匙串，Windows 和 Linux 放环境变量。配置项说明见 [references/mcp-config.md](references/mcp-config.md)。
 
 ### 常用选项
 
@@ -74,6 +74,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 | `--token-stdin` | 从标准输入读取 token，适合脚本批量安装 |
 | `--token-store env` | 配置中只引用环境变量 `ELK_MCP_TOKEN`，不写入 token 本身 |
 | `--clients claude,codex` | 指定要配置的客户端（默认自动检测） |
+| `--gitnexus <路径>` | 本地模式：指定 gitnexus 的可执行文件或安装目录（npm 全局目录、nvm 版本目录、gitnexus 包目录均可）。不填则自动检测，检测不到时会询问 |
+| `--node <路径>` | 本地模式：指定运行 gitnexus 的 node（要求 ≥22.18）。不填则自动选择 |
 | `--link` | 用符号链接（Windows 上用 junction）指向仓库，不复制文件；之后 `git pull` 即生效 |
 | `--dry-run` | 只显示将要执行的操作，不写入任何文件 |
 | `-y` | 非交互，已有条目直接替换（会先备份） |

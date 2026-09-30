@@ -309,17 +309,18 @@ class Handler(BaseHTTPRequestHandler):
 def start_gitnexus():
     """托管 gitnexus MCP（只监听 127.0.0.1，内部 token 经环境变量传入，不出现在命令行）；退出后自动重启。"""
     ccfg = mcp.code.load_code_config()
-    gn = ccfg["gitnexus"]
-    if not os.path.exists(gn):
-        log("未找到 gitnexus（%s），/gitnexus/mcp 不可用" % gn)
+    gn = mcp.code.gitnexus(ccfg)
+    if gn.get("error"):
+        log("%s；/gitnexus/mcp 不可用" % gn["error"])
         return
+    log("使用 %s" % mcp.code.gitnexus_bin.describe(gn))
     logfile = os.path.join(mcp.code._cache_dir(ccfg), "gitnexus-mcp.log")
     env = dict(mcp.code._gitnexus_env(ccfg), GITNEXUS_MCP_AUTH_TOKEN=GN_TOKEN)
 
     def loop():
         while True:
             with open(logfile, "a", encoding="utf-8") as out:
-                proc = subprocess.Popen([gn, "mcp", "--http", "--host", "127.0.0.1", "--port", str(GN_PORT)],
+                proc = subprocess.Popen(gn["argv"] + ["mcp", "--http", "--host", "127.0.0.1", "--port", str(GN_PORT)],
                                         env=env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
                 log("gitnexus MCP 已启动（pid %d，127.0.0.1:%d，转发路径 %s/mcp）" % (proc.pid, GN_PORT, GN_PREFIX))
                 code = proc.wait()
