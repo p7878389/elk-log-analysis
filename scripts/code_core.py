@@ -6,6 +6,7 @@
 - 读取某个 commit 的源码一律用 git show / ls-tree，不依赖 worktree 当前检出状态。
 """
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -529,7 +530,21 @@ def worktree_target(ctx, exact=False):
     c, h = ctx["commit"]["sha"], ctx["head"]["sha"]
     if exact and c != h:
         return c, c[:10]
-    return h, ctx["branch"]
+    return h, safe_ref(ctx["branch"])
+
+
+_UNSAFE_REF_CHARS = re.compile(r"[^\w.-]")
+
+
+def safe_ref(ref):
+    """分支名 → 可作单级目录/文件名的后缀。名称会拼进 worktree 目录、索引任务/日志、使用记录文件和 GitNexus 注册名，
+    `release/1.0` 原样拼接会变成多级路径，写缓存文件时父目录不存在而失败。
+    只含字母数字 _ . - 且不以 . 开头的（beta、staging、master 等）原样返回，已有 worktree 与索引名不变；
+    其余把非法字符替换为 -，再追加原名 sha1 前 6 位，避免 release/1.0 与真实分支 release-1.0 撞名。"""
+    safe = _UNSAFE_REF_CHARS.sub("-", ref)
+    if safe == ref and not ref.startswith("."):
+        return ref
+    return "%s-%s" % (safe.strip(".-") or "ref", hashlib.sha1(ref.encode("utf-8")).hexdigest()[:6])
 
 
 def worktree_name(info, ctx, exact=False):
