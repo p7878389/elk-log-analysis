@@ -15,6 +15,27 @@
 
 ### 方式一：Docker（推荐，任何系统）
 
+**一键脚本**（推荐）。第一次运行会从模板创建 `.env` 和 `config/envs.json` 然后退出，填好后再运行一次：构建镜像，`config/tokens.json` 不存在时生成一个管理员 token（只显示这一次），后台启动并等待 `/healthz` 就绪。宿主机不需要装 Python。
+
+```bash
+git clone <本仓库> /opt/elk-log-analysis && cd /opt/elk-log-analysis
+deploy/docker-up.sh                    # 首次：创建配置文件后退出
+deploy/docker-up.sh                    # 填好后：构建、生成管理员 token、启动
+deploy/docker-up.sh --target code      # 含源码分析；--tls 同时启动 Caddy；--publish 8765 内网直连
+deploy/docker-up.sh status | logs | down
+```
+
+Windows（Docker Desktop）在 PowerShell 中运行，参数相同：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\docker-up.ps1
+powershell -ExecutionPolicy Bypass -File deploy\docker-up.ps1 -Target code -Publish 8765
+```
+
+`--target`、`--tls`、`--publish` 会写进 `.env`（`ELK_IMAGE_TARGET`、`COMPOSE_PROFILES`、`ELK_HTTP_PUBLISH`），以后直接 `docker compose up -d` 也沿用同样的设置。
+
+**手动部署**：
+
 ```bash
 git clone <本仓库> /opt/elk-log-analysis && cd /opt/elk-log-analysis/deploy
 cp .env.example .env && chmod 600 .env            # 填 ELK_TEST_PASSWORD / ELK_PROD_PASSWORD
@@ -28,6 +49,10 @@ curl http://127.0.0.1:8765/healthz                # 返回 ok
 - **HTTPS**：服务器有公网域名时，在 `.env` 中设置 `ELK_DOMAIN`，然后运行 `docker compose --profile tls up -d --build`，Caddy 会自动申请证书。纯内网的做法见 `Caddyfile` 中的注释，也可以用 `ELK_HTTP_CERT`/`ELK_HTTP_KEY` 由服务直接提供 HTTPS。
 - **不走代理、内网直连**：把 `.env` 中的 `ELK_HTTP_PUBLISH` 设为 `8765`，即监听所有网卡。
 - **需要源码定位和调用链分析**：用 `ELK_IMAGE_TARGET=code docker compose up -d --build`，并配置 GitLab 仓库同步，见[第 4 节](#4-gitlab-仓库同步与服务端-gitnexus)。
+- **常驻运行**：容器配置了 `restart: unless-stopped`，进程退出会自动拉起，宿主机重启后随 Docker 一起恢复；只有手动 `down` 或 `stop` 后才不再启动。前提是 Docker 本身开机自启：
+  - Linux：`sudo systemctl enable docker`。
+  - macOS / Windows 的 Docker Desktop：在设置中勾选 *Start Docker Desktop when you sign in*。Docker Desktop 跟随用户登录启动，没人登录时服务不会运行。如果 Windows 服务器需要无人登录也常驻，可以配置开机自动登录，或改用下面原生部署里的计划任务方式。
+- **进程与日志**：镜像以 `tini` 作为 PID 1，`docker stop` 能立即退出，后台索引进程结束后也会被回收；容器日志按 10MB × 5 个文件轮转，不会撑满磁盘。
 
 ### 方式二：原生运行（不用 Docker）
 
@@ -215,6 +240,7 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 |---|---|
 | 看日志（每次工具调用一行：成员、工具、环境、耗时） | `docker compose logs -f elk-mcp`、`journalctl -u elk-mcp -f`，或 Windows 上的 `deploy\data\elk-mcp.log` |
 | 结构化调用日志 | 容器内 `/data/cache/mcp.log`（不含参数值和日志内容） |
-| 升级 | `git pull && docker compose up -d --build`，成员侧无需任何改动 |
+| 启停与状态（Docker） | `deploy/docker-up.sh status`、`logs`、`down`，Windows 用 `deploy\docker-up.ps1` 加同样的参数 |
+| 升级 | `git pull && docker compose up -d --build`（或重新运行 `deploy/docker-up.sh`），成员侧无需任何改动 |
 | 服务端自检 | 用 admin token 调用 `elk_doctor`，或 `docker compose exec elk-mcp python /app/scripts/elk.py doctor` |
 | 客户端连不上 | 先 `curl https://<域名>/healthz`；返回 401 说明 token 错误或已停用；再用 `claude mcp list` 查看具体报错 |

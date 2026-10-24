@@ -3,8 +3,10 @@
 # target=code：额外带 node + gitnexus，支持 code_* 源码定位、GitLab 仓库同步后的索引预建，
 #              并在 /gitnexus/mcp 向成员提供服务端的 GitNexus 查询
 FROM python:3.12-slim-bookworm AS base
+# procps：code_* 用 ps 判断后台索引进程是否仍在运行（slim 镜像默认没有）
+# tini：作为 PID 1 转发 SIGTERM（docker stop 立即退出，不必等 10 秒被强杀），并回收 nohup 启动的后台索引进程
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git openssh-client ca-certificates tzdata \
+ && apt-get install -y --no-install-recommends git openssh-client ca-certificates tzdata procps tini \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m -u 10001 elk \
  && mkdir -p /data /config /repos && chown elk:elk /data /repos
@@ -22,6 +24,7 @@ EXPOSE 8765
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD python -c "import urllib.request,os;urllib.request.urlopen('http://127.0.0.1:%s/healthz'%os.environ['ELK_HTTP_PORT'],timeout=3)"
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "/app/scripts/mcp_http.py"]
 
 FROM base AS code

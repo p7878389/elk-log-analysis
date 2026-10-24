@@ -1,8 +1,18 @@
-# 用法（在 deploy 目录下）：
+# 推荐用一键脚本：deploy/docker-up.sh（Windows：deploy\docker-up.ps1），首次运行会初始化配置并生成管理员 token
+# 手动用法（在 deploy 目录下）：
 #   cp .env.example .env && cp config/envs.example.json config/envs.json && cp config/tokens.example.json config/tokens.json
 #   docker compose up -d --build                 # 仅日志查询
 #   ELK_IMAGE_TARGET=code docker compose up -d --build   # 含源码分析 + GitLab 仓库定时同步 + 服务端 GitNexus
 #   docker compose --profile tls up -d --build   # 同时启动 Caddy 自动 HTTPS（需公网域名，见 Caddyfile）
+# ELK_IMAGE_TARGET / ELK_HTTP_PUBLISH / COMPOSE_PROFILES 也可以写在 .env 中，之后直接 docker compose up -d 即可
+
+# 常驻运行时容器日志会一直增长：按大小轮转，最多保留 5 个 10MB 文件
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   elk-mcp:
     build:
@@ -11,6 +21,7 @@ services:
       target: ${ELK_IMAGE_TARGET:-base}
     image: elk-mcp:${ELK_IMAGE_TARGET:-base}
     restart: unless-stopped
+    logging: *logging
     env_file: .env
     ports:
       # 默认只监听本机，由反向代理对外；内网直连可改为 "8765:8765"
@@ -31,12 +42,15 @@ services:
     profiles: ["tls"]
     image: caddy:2
     restart: unless-stopped
+    logging: *logging
     env_file: .env
     ports: ["80:80", "443:443"]
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
-    depends_on: [elk-mcp]
+    depends_on:
+      elk-mcp:
+        condition: service_healthy
 
 volumes:
   elk-data:
