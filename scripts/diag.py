@@ -34,6 +34,8 @@ CATEGORIES = [
      "账号缺少权限：ping/检索已自动回退；若检索仍 403，需要在 Kibana 给账号授予索引 read 权限"),
     ("bad_request", re.compile(r"HTTP 400"), "info", "查询语法或字段错误：检查 Lucene 语法，用 elk_fields 核对字段名"),
     ("server_5xx", re.compile(r"HTTP 5\d\d"), "warn", "ES/Kibana 服务端异常：稍后重试或缩小时间范围"),
+    ("slow_guard", re.compile(r"慢查询护栏"), "info",
+     "生产慢查询护栏拦截（预期行为）：改用 host/service 过滤、缩小 since；确需时传 allow_slow=true"),
     ("timeout", re.compile(r"超时|timed out|timeout", re.I), "warn", "查询超时：缩小 since 范围，或调大 ELK_<ENV>_TIMEOUT"),
     ("connect", re.compile(r"连接失败|Connection refused|URLError|Name or service not known|nodename"), "warn",
      "网络不通：检查 VPN/内网 DNS；需要代理时配置 ELK_<ENV>_PROXY"),

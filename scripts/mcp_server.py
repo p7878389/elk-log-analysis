@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import code_core as code  # noqa: E402
 import diag  # noqa: E402
 import elk_core as core  # noqa: E402
+import dsl_guard  # noqa: E402
 import repo_sync  # noqa: E402
 
 SERVER_INFO = {"name": "elk-log-analysis", "version": "1.0.0"}
@@ -22,6 +23,9 @@ INSTRUCTIONS = (
     "只读查询 ELK 日志。先 elk_envs 了解环境；用户未指定环境时用默认环境并在回复中说明；"
     "生产环境仅在用户明确要求（生产/prod/线上）时查询，并传 confirm_production=true。"
     "先 elk_agg 看量级与趋势，再 elk_search 小批量看明细，再 elk_trace 串链路。"
+    "生产查询避免前导通配（*abc、message:*abc*）和超过 7 天的范围：主机/Pod 用 host 参数（支持 前缀* 与 *片段*），"
+    "应用用 service 参数，先用 elk_agg + interval 定位时间段再缩小 since/until；"
+    "被慢查询护栏拦截时优先缩小条件，确实无法缩小才传 allow_slow=true。"
     "日志不足以判断根因时，用 code_locate 把堆栈定位到对应环境分支的源码，"
     "需要调用链/影响面时用 code_prepare 准备只读 worktree 与 GitNexus 索引。"
     "工具反复报错或行为异常时，用 elk_doctor 自检（fix=true 只修复缓存/运行时状态）。"
@@ -33,17 +37,26 @@ CONFIRM_PROP = {"type": "boolean",
 FILTER_PROPS = {
     "env": ENV_PROP,
     "confirm_production": CONFIRM_PROP,
-    "query": {"type": "string", "description": "Lucene query_string，如 'NullPointerException AND order'"},
-    "since": {"type": "string", "description": "起始时间：15m/2h/1d，或 'YYYY-MM-DD HH:MM'（按 tz），默认 15m"},
+    "query": {"type": "string",
+              "description": "Lucene query_string，如 'NullPointerException AND order'。避免前导通配（*abc、message:*abc*），"
+                             "生产环境会被慢查询护栏拦截；按主机/应用过滤请用 host/service 参数"},
+    "since": {"type": "string",
+              "description": "起始时间：15m/2h/1d，或 'YYYY-MM-DD HH:MM'（按 tz），默认 15m。"
+                             "生产环境未按 traceId 过滤时超过 7 天会被慢查询护栏拦截"},
     "until": {"type": "string", "description": "结束时间，默认 now"},
     "level": {"type": "string", "description": "日志级别，逗号分隔，如 ERROR,WARN"},
     "service": {"type": "string", "description": "应用名，逗号分隔"},
-    "host": {"type": "string", "description": "主机/Pod"},
+    "host": {"type": "string",
+             "description": "主机/Pod，逗号分隔可多个；支持 前缀*（如 equipment-apply-manage*）与 *片段*，"
+                            "作用于 keyword 子字段，比在 query 里写 host.name:*x* 快得多"},
     "logger": {"type": "string", "description": "logger 名"},
     "terms": {"type": "object", "additionalProperties": {"type": "string"},
               "description": "任意字段精确过滤 {field: value}"},
     "index": {"type": "string", "description": "索引或索引别名（见 elk_envs 的 index-alias），逗号分隔可多个；不传用环境默认索引"},
     "tz": {"type": "string", "description": "时区，默认 +08:00"},
+    "allow_slow": {"type": "boolean",
+                   "description": "生产环境 query 含前导通配或时间范围超过 7 天时必须为 true 才执行；"
+                                  "仅在缩小范围或改用 host/service 过滤确实不可行时设置"},
 }
 OUTPUT_PROPS = {
     "size": {"type": "integer", "description": "返回条数，默认 50，受环境 max_size 限制"},
@@ -91,8 +104,11 @@ TOOLS = [
                                 interval={"type": "string", "description": "如 1m/5m/1h"},
                                 top={"type": "integer", "description": "TopN，默认 20"}))},
     {"name": "elk_query_dsl",
-     "description": "执行自定义 Query DSL（仅 _search/_count）。复杂场景使用，size 受环境 max_size 限制",
+     "description": "执行自定义 Query DSL（仅 _search/_count）。生产默认过滤近 15 分钟；复杂 DSL/聚合需 allow_slow；size 和 timeout 受限",
      "inputSchema": schema({"env": ENV_PROP, "confirm_production": CONFIRM_PROP,
+                            "since": FILTER_PROPS["since"], "until": FILTER_PROPS["until"],
+                            "tz": FILTER_PROPS["tz"],
+                            "allow_slow": {"type": "boolean", "description": "显式放行生产复杂 DSL 或超长时间范围，优先缩小范围或使用 elk_agg"},
                             "index": FILTER_PROPS["index"],
                             "api": {"type": "string", "enum": ["_search", "_count"]},
                             "body": {"type": "object", "description": "Query DSL 请求体"}},
@@ -229,10 +245,11 @@ def handle_tool(name, a):
         p = dict(a, tz=a.get("tz") or "+08:00")
         return core.op_agg(env, p, tz, interactive=ia)
     if name == "elk_query_dsl":
-        body = dict(a["body"])
+        body = dsl_guard.prepare(env, a, tz)
         api = a.get("api") or "_search"
         if api == "_search":
             body["size"] = min(int(body.get("size", 50)), int(env.get("max_size", 500)))
+            body.setdefault("timeout", core.search_timeout(env))
         idx = core.resolve_index(env, a.get("index"))
         return core.op_raw(env, "POST", "/%s/%s" % (idx, api), body, interactive=ia)
     raise core.ElkError("未知工具: %s" % name)

@@ -21,9 +21,11 @@ def add_filters(p):
     p.add_argument("--until", default="now", help="结束，默认 now")
     p.add_argument("--level", help="日志级别，逗号分隔：ERROR,WARN")
     p.add_argument("--service", help="应用名，逗号分隔")
-    p.add_argument("--host", help="主机/Pod")
+    p.add_argument("--host", help="主机/Pod，逗号分隔；支持 前缀* 与 *片段*（作用于 keyword 子字段）")
     p.add_argument("--logger", help="logger 名")
     p.add_argument("--trace", help="traceId")
+    p.add_argument("--allow-slow", action="store_true",
+                   help="生产环境 query 含前导通配或时间范围超过 7 天时，确认仍要执行")
     p.add_argument("--term", action="append", default=[], help="字段精确过滤 field=value，可重复")
     p.add_argument("-i", "--index", help="覆盖环境默认索引")
     p.add_argument("--dsl", action="store_true", help="只打印 DSL 不执行")

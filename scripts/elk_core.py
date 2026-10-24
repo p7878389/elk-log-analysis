@@ -9,6 +9,7 @@ import getpass
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -47,6 +48,14 @@ DEFAULT_FIELDS = {
 
 # 明细默认展示列；可用环境 COLUMNS 或 columns 参数覆盖
 DEFAULT_COLUMNS = ["time.keyword", "level", "host.name", "traceId", "message"]
+
+# ES 服务端搜索超时（秒）：到点返回已收集的部分结果（timed_out=true），取值不超过客户端 TIMEOUT-5
+DEFAULT_SEARCH_TIMEOUT = 25
+# 生产环境慢查询护栏：时间跨度超过该天数（未按 traceId 过滤）或 query 含前导通配时，需 allow_slow=true
+DEFAULT_SLOW_GUARD_DAYS = 7
+# 前导通配：*abc / field:*abc* / ?abc；单独的 * 或 field:*（ES 改写为 exists）不算
+LEADING_WILDCARD = re.compile(r"(?:^|[\s(:!+\-])[*?](?![\s)]|$)")
+QUOTED = re.compile(r'"(?:\\.|[^"\\])*"')
 
 # 输出脱敏：手机号、身份证号
 MASK_RULES = [
@@ -569,11 +578,32 @@ def _http(env, url, headers, data, method):
         err.status = e.code
         raise err
     except urllib.error.URLError as e:
+        if isinstance(e.reason, socket.timeout):
+            raise _timeout_error(env)
         raise ElkError("连接失败: %s（检查 VPN/域名/证书）" % e.reason)
+    except socket.timeout:  # 读响应超时：Python 3.9 中不是 URLError 子类，原先会落成"内部错误"
+        raise _timeout_error(env)
     try:
         return json.loads(raw)
     except ValueError:
         return raw
+
+
+def _timeout_error(env):
+    return ElkError("请求超时：%ss 内未收到 ES/Kibana 响应。请缩小 since、加 service/host/trace 过滤、"
+                    "避免前导通配后重试；确需更长等待时调大 ELK_<ENV>_TIMEOUT" % env.get("timeout", 60))
+
+
+def search_timeout(env):
+    """ES 服务端超时（如 "25s"）：比客户端超时至少早 5 秒，保证先拿到部分结果而不是断开连接。"""
+    client = int(env.get("timeout", 60))
+    return "%ds" % max(1, min(int(env.get("search_timeout", DEFAULT_SEARCH_TIMEOUT)), client - 5))
+
+
+def _partial_note(env, res):
+    if isinstance(res, dict) and res.get("timed_out"):
+        return "# 注: 已达服务端超时 %s，结果不完整（timed_out=true）；请缩小 since 或增加过滤条件" % search_timeout(env)
+    return None
 
 
 def call(env, method, path, body=None, interactive=True):
@@ -615,8 +645,11 @@ def _kibana_search(env, base, headers, index, body):
     h = dict(headers)
     h["elastic-api-version"] = "1"
     h["x-elastic-internal-origin"] = "Kibana"
-    payload = {"params": {"index": index, "body": body or {}}}
-    res = _http(env, base + "/internal/search/es", h, json.dumps(payload).encode(), "POST")
+    body = dict(body or {})
+    params = {"index": index, "body": body}
+    if "timeout" in body:  # 该接口忽略 body.timeout，只认 params.timeout（实测）
+        params["timeout"] = body.pop("timeout")
+    res = _http(env, base + "/internal/search/es", h, json.dumps({"params": params}).encode(), "POST")
     if isinstance(res, dict) and "rawResponse" in res:
         return res["rawResponse"]
     return res
@@ -688,6 +721,56 @@ def parse_time(value, tz):
     return value  # 原样透传（ES date math 或带时区 ISO）
 
 
+def _host_clause(f, value):
+    """host 支持 前缀* 与 *片段*：作用于 keyword 子字段，只扫主机名词典，比在 query 里写 host.name:*x* 快得多。"""
+    if "*" not in value and "?" not in value:
+        return {"match_phrase": {f["host"]: value}}
+    field = f.get("host_keyword") or (f["host"] if f["host"].endswith(".keyword") else f["host"] + ".keyword")
+    if value.endswith("*") and "*" not in value[:-1] and "?" not in value:
+        return {"prefix": {field: value[:-1]}}
+    return {"wildcard": {field: value}}
+
+
+def _span_days(p, tz):
+    """since~until 的跨度（天）；无法解析（ES date math 等）时返回 None。"""
+    now = datetime.now(timezone.utc)
+
+    def at(value):
+        if value in (None, "", "now"):
+            return now
+        m = REL_TIME.match(value)
+        if m:
+            unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+            return now - timedelta(seconds=int(m.group(1)) * unit)
+        try:
+            return datetime.strptime(parse_time(value, tz), "%Y-%m-%dT%H:%M:%S.000Z").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    start, end = at(p.get("since") or "15m"), at(p.get("until"))
+    if start is None or end is None:
+        return None
+    return (end - start).total_seconds() / 86400
+
+
+def check_slow_query(env, p, tz):
+    """生产环境慢查询护栏：前导通配要扫全部 term，超长时间范围要扫大量分片，容易超时并拖住单线程 MCP。"""
+    if not env.get("production") or p.get("allow_slow") is True:
+        return
+    reasons = []
+    if LEADING_WILDCARD.search(QUOTED.sub('""', p.get("query") or "")):
+        reasons.append("query 含前导通配（如 *abc 或 field:*abc*）")
+    limit = float(env.get("slow_guard_days", DEFAULT_SLOW_GUARD_DAYS))
+    span = _span_days(p, tz)
+    if not p.get("trace") and span is not None and span > limit:
+        reasons.append("时间范围约 %.1f 天，超过 %g 天" % (span, limit))
+    if reasons:
+        raise ElkError("慢查询护栏：%s 是生产环境，%s。建议：主机/Pod 用 host 参数（支持 前缀* 与 *片段*），"
+                       "应用用 service 参数；先用 elk_agg + interval 定位时间段，再缩小 since/until。"
+                       "确实无法缩小时再传 allow_slow=true（CLI 用 --allow-slow）。"
+                       % (env["_name"], "；".join(reasons)))
+
+
 def build_query(env, p, tz):
     """p: dict，键 query/since/until/level/service/trace/host/logger/terms。"""
     f = env["_fields"]
@@ -704,7 +787,8 @@ def build_query(env, p, tz):
         if v:
             values = [x.strip() for x in str(v).split(",") if x.strip()]
             filt.append({"bool": {"should": [
-                {"match_phrase": {f[k]: x}} for x in values], "minimum_should_match": 1}})
+                _host_clause(f, x) if k == "host" else {"match_phrase": {f[k]: x}} for x in values],
+                "minimum_should_match": 1}})
     for k, v in (p.get("terms") or {}).items():
         filt.append({"match_phrase": {k: v}})
     return {"bool": {"must": must or [{"match_all": {}}], "filter": filt}}
@@ -843,6 +927,7 @@ def search_body(env, p, tz):
     size = min(int(p.get("size") or 50), int(env.get("max_size", 500)))
     return {
         "size": size,
+        "timeout": search_timeout(env),
         "track_total_hits": True,
         "sort": [{f["sort"]: {"order": "desc" if p.get("desc") else "asc",
                               "missing": "_last", "unmapped_type": "keyword"}}],
@@ -851,12 +936,16 @@ def search_body(env, p, tz):
 
 
 def op_search(env, p, tz, interactive=True):
+    check_slow_query(env, p, tz)
     body = search_body(env, p, tz)
     idx = index_of(env, p)
     res = call(env, "POST", "/%s/_search" % idx, body, interactive=interactive)
     hits = res.get("hits", {}).get("hits", [])
     head = "# env=%s index=%s total=%s shown=%d took=%sms" % (
         env["_name"], idx, _total(res), len(hits), res.get("took"))
+    partial = _partial_note(env, res)
+    if partial:
+        head += "\n" + partial
     if p.get("json"):
         return head + "\n" + mask(env, json.dumps(
             [h.get("_source") for h in hits], ensure_ascii=False, indent=2))
@@ -881,10 +970,12 @@ def agg_body(env, p, tz):
         aggs = {"top": {"terms": {"field": field, "size": top}}}
     else:
         raise ElkError("agg 需要 field 或 interval")
-    return {"size": 0, "track_total_hits": True, "query": build_query(env, p, tz), "aggs": aggs}
+    return {"size": 0, "timeout": search_timeout(env), "track_total_hits": True,
+            "query": build_query(env, p, tz), "aggs": aggs}
 
 
 def op_agg(env, p, tz, interactive=True):
+    check_slow_query(env, p, tz)
     body = agg_body(env, p, tz)
     note = None
     try:
@@ -900,8 +991,9 @@ def op_agg(env, p, tz, interactive=True):
         note = "# 注: %s 是 text 字段，已自动改用 %s.keyword" % (field, field)
         _healed("agg_text_field_keyword", field)
     lines = ["# env=%s total=%s" % (env["_name"], _total(res))]
-    if note:
-        lines.append(note)
+    for n in (note, _partial_note(env, res)):
+        if n:
+            lines.append(n)
     aggs = res.get("aggregations", {})
     if "trend" in aggs:
         for b in aggs["trend"]["buckets"]:
