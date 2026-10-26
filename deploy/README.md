@@ -66,7 +66,56 @@ curl http://127.0.0.1:8765/healthz                # 返回 ok
 
 临时试跑，各系统相同：`python3 scripts/mcp_http.py --env-file deploy/.env`（Windows 上用 `python`）。
 
-> 原生 Windows 支持全部 `elk_*` 工具和 `code_locate`。`code_prepare` 需要后台构建 GitNexus 索引，只能在 Docker 或 WSL 上用。服务器上的 ELK 密码只能写 `env:` 引用，`keychain:` 仅 macOS 本机可用。
+#### Windows 当前用户部署（无需管理员）
+
+先创建 `deploy/.env`、`deploy/config/envs.json` 和 `deploy/config/tokens.json`，
+并在 `.env` 中启用上面的原生部署配置。使用真实 Python 安装路径，或让脚本通过 `py -3` 自动查找：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\native-up.ps1 -InstallStartup
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\native-up.ps1 status
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\native-up.ps1 stop
+```
+
+脚本在后台启动服务并等待健康检查；再次启动不会重复创建进程。日志在
+`deploy/data/http.stderr.log`。`-InstallStartup` 为当前用户安装登录启动快捷方式，
+`stop` 同时停止服务并删除快捷方式。此模式需要用户登录，不提供进程崩溃自动恢复；
+无人登录运行和自动恢复请使用上面的 SYSTEM 计划任务或 Docker 部署。
+
+外部 MCP 客户端连接 `http://<Windows 局域网 IP>:8765/mcp`，携带
+`Authorization: Bearer <成员 token>`。需设置 `ELK_HTTP_HOST=0.0.0.0`，
+并确保网络和主机防火墙允许目标端口。HTTP 仅用于可信内网；公网部署使用 HTTPS。
+密码保存在被 Git 忽略的 `.env`，环境 JSON 使用 `env:变量名` 引用。
+令牌明文和客户端配置应保存在被 Git 忽略、仅当前用户可读的 `deploy/data/`。
+
+### 手动 clone GitLab 仓库
+
+当目标仓库不在 `ELK_CODE_ROOT`、且 GitNexus 索引不存在时，管理员可以直接调用
+`code_prepare`，传入 `git_url` 和 `access_token`，可选 `repo_name`、`branch`：
+
+```json
+{"name":"code_prepare","arguments":{
+  "env":"test","git_url":"https://gitlab.example.com/group/service.git",
+  "access_token":"glpat-...","repo_name":"service","branch":"beta"
+}}
+```
+
+服务会把仓库 clone 到 `ELK_CODE_ROOT` 第一个目录，再创建只读 worktree 和 GitNexus 索引。
+`branch` 会作为本次请求的唯一分支来源，同时用于 clone 和后续索引；不传时才使用环境默认分支。
+access token 只在本次 Git 操作的进程环境中使用，不写入 URL、remote、配置文件或日志；
+此操作会写入服务端代码目录，因此仅 `admin: true` 的成员 token 可用。建议使用仅有
+`read_repository` 权限且设置有效期的 GitLab token。
+
+> 原生 Windows、macOS 和 Linux 均支持 `code_prepare` 的后台 GitNexus 索引。服务器上的 ELK 密码只能写 `env:` 引用，`keychain:` 仅 macOS 本机可用。
+
+原生 Windows 也可以通过 `/gitnexus/mcp` 查询已经建立的 GitNexus 索引，并支持 `code_prepare`
+后台构建索引。在 `.env` 中启用
+`ELK_GITNEXUS_MCP=1`，必要时通过 `ELK_CODE_GITNEXUS` 指定 GitNexus 包目录、
+`ELK_CODE_NODE` 指定 `node.exe`，重启服务即可。GitNexus 仅监听本机 `8767`，
+外部成员访问 `http://<服务 IP>:8765/gitnexus/mcp`，使用与 ELK 相同的 Bearer token。
+此入口沿用该服务账户的 GitNexus 仓库登记表，具有 `code` 权限的成员可以查询其中的全部仓库；
+`rename` 和 `group_sync` 被拒绝。新增或更新索引可在目标仓库运行
+`gitnexus analyze --index-only`；维护索引前先停止共享服务，完成后重新启动。
 
 ## 2. 成员管理
 

@@ -163,6 +163,12 @@ ELK_PROD_MAX_SIZE=2000
 | `ELK_CODE_GC_DAYS` | 分支 worktree（`<仓库>@<分支>`）闲置多少天后自动删除（连同 GitNexus 索引）；`0` 关闭 | 默认 `10` |
 | `ELK_CODE_GC_EXACT_DAYS` | 按 commit 的 worktree（`<仓库>@<commit>`，exact 模式产生）闲置多少天后自动删除；`0` 关闭 | 默认 `3` |
 | `ELK_CODE_AUTO_INDEX` | `code_prepare` 时是否自动后台构建/增量更新 GitNexus 索引 | 默认 `true` |
+
+`code_prepare` 还支持管理员临时传入 `git_url` + `access_token`（可选 `repo_name`、`branch`）。
+当本地仓库不存在时，服务会用临时 `PRIVATE-TOKEN` 请求头 clone 到 `ELK_CODE_ROOT`，随后继续建立
+worktree 和索引。token 不会写入 remote URL、配置文件或日志。
+传入 `branch` 时，该值优先于环境默认分支，并同时用于 clone、fetch 后的 worktree 与索引；
+未传时才按环境配置选择分支。
 | `ELK_CODE_GITNEXUS` | gitnexus 的**可执行文件或安装目录**，可以填 npm 全局目录、nvm 版本目录或 gitnexus 包目录。填的路径失效时（比如切换了 nvm 版本），会自动改用检测到的位置，并在 `elk_doctor` 中提示 | 不填则自动检测，见下文 |
 | `ELK_CODE_NODE` | 运行 gitnexus 的 node。gitnexus 要求 node ≥22.18 | 不填则优先用 gitnexus 同目录的 node，再选满足版本要求的 |
 

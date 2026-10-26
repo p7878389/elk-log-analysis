@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
 
 try:
@@ -212,6 +213,53 @@ def repo_map(cfg):
             out[name] = p
         return out
     return _memo(("repos", tuple(cfg["roots"])), 60, build)
+
+
+def clone_manual(cfg, url, access_token, name=None, branch=None):
+    """Clone one GitLab repository using an ephemeral PRIVATE-TOKEN header.
+
+    The token is passed through Git's environment configuration, so it never
+    appears in the remote URL, command line, clone manifest, or service log.
+    """
+    parsed = urllib.parse.urlsplit((url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username:
+        raise core.ElkError("git_url 必须是 GitLab 的 http(s) clone 地址，且不能包含用户名或 token")
+    if not access_token or not str(access_token).strip():
+        raise core.ElkError("手动 clone 必须提供 access_token")
+    root = cfg["roots"][0] if cfg.get("roots") else ""
+    if not root:
+        raise core.ElkError("未配置 ELK_CODE_ROOT，无法保存 clone 的仓库")
+    repo_name = re.sub(r"[^A-Za-z0-9_.-]", "-", (name or os.path.basename(parsed.path.rstrip("/"))).removesuffix(".git"))
+    if not repo_name or repo_name in (".", ".."):
+        raise core.ElkError("无法从 git_url 推断仓库名，请传 repo_name")
+    target = os.path.join(root, repo_name)
+    if os.path.exists(target):
+        if _is_repo(target):
+            raise core.ElkError("目标仓库目录已存在：%s；请直接传 repo=%s，或先移除该目录" % (target, repo_name))
+        raise core.ElkError("目标路径已存在且不是 Git 仓库：%s" % target)
+    os.makedirs(root, exist_ok=True)
+    tmp = os.path.join(root, ".%s.manual-cloning" % repo_name)
+    shutil.rmtree(tmp, ignore_errors=True)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
+               GIT_CONFIG_VALUE_0="PRIVATE-TOKEN: %s" % str(access_token).strip())
+    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "clone", "--filter=blob:none", "--no-tags"]
+    if branch:
+        cmd += ["--branch", str(branch)]
+    cmd += [url.strip(), tmp]
+    try:
+        r = subprocess.run(cmd, cwd=root, env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise core.ElkError("GitLab clone 超时（1800s）")
+    if r.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        detail = (r.stderr or r.stdout or "").strip().splitlines()
+        detail = next((x.strip() for x in detail if x.strip().lower().startswith(("fatal:", "remote:", "error:"))), "未知错误")
+        raise core.ElkError("GitLab clone 失败：%s" % detail[:400])
+    os.replace(tmp, target)
+    _MEMO.pop(("repos", tuple(cfg["roots"])), None)
+    return repo_name, target
 
 
 def list_repos(cfg):
@@ -437,9 +485,14 @@ def branch_spec(cfg, env):
     return None, None
 
 
-def env_branch(cfg, repo_path, env):
+def env_branch(cfg, repo_path, env, requested=None):
     env_name = env["_name"]
-    spec, _ = branch_spec(cfg, env)
+    spec = (requested or "").strip() or None
+    source = "MCP branch 参数" if spec else None
+    if spec and "," in spec:
+        raise core.ElkError("MCP branch 只能传一个分支名，不能包含逗号")
+    if not spec:
+        spec, source = branch_spec(cfg, env)
     if not spec:
         raise core.ElkError("环境 %s 未配置代码分支，也无法按名称推断级别：请在 cc-switch 中设置 %sBRANCH=<分支>"
                             "（或 %sTIER=dev/test/staging/prod）" % (env_name, core.env_prefix(env_name),
@@ -492,7 +545,7 @@ def resolve_commit(cfg, env, a, info, tz, allow_elk):
     """选定环境分支，并确定要看的 commit：显式 commit > 部署时间对齐 > 分支最新。"""
     repo_path = info["repo_path"]
     fetch_note = fetch(cfg, repo_path, force=a.get("fetch") is True)
-    branch = env_branch(cfg, repo_path, env)
+    branch = env_branch(cfg, repo_path, env, a.get("branch"))
     head = commit_info(repo_path, "origin/" + branch)
     ctx = {"branch": branch, "head": head, "commit": head, "fetch_note": fetch_note, "align": "分支最新提交"}
     if a.get("commit"):
@@ -556,8 +609,18 @@ def _index_file(cfg, name):
 
 
 def _alive(pid):
-    if os.name == "nt":  # Windows 上 os.kill(pid, 0) 会直接结束进程；原生 Windows 不支持后台索引，见 start_index
+    if not pid:
         return False
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates the process on Windows. tasklist only checks
+        # whether the recorded PID is still present; the index log is used to
+        # distinguish a completed or failed job.
+        try:
+            r = subprocess.run(["tasklist", "/FI", "PID eq %s" % pid, "/FO", "CSV", "/NH"],
+                               capture_output=True, text=True, timeout=5)
+            return r.returncode == 0 and ("%s" % pid) in (r.stdout or "")
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     try:
         os.kill(pid, 0)
     except (OSError, TypeError):
@@ -618,16 +681,21 @@ def _gitnexus_env(cfg):
 
 
 def start_index(cfg, wt, name, commit):
-    if os.name == "nt":
-        raise core.ElkError("原生 Windows 部署不支持后台构建 GitNexus 索引，请改用 Docker 或 WSL 部署")
     cmd = gitnexus_argv(cfg, "analyze", "--index-only", "--name", name, wt)
     log = os.path.join(_cache_dir(cfg, "index"), name + ".log")
     env = _gitnexus_env(cfg)
-    # 经 sh 后台启动：进程脱离 MCP 进程组，不留僵尸，MCP 重启也不会中断索引
-    script = 'log="$1"; shift; nohup "$@" >"$log" 2>&1 </dev/null & echo $!'
-    r = subprocess.run(["/bin/sh", "-c", script, "sh", log] + cmd, cwd=wt, env=env,
-                       capture_output=True, text=True, timeout=15, start_new_session=True)
-    pid = int(r.stdout.strip().splitlines()[-1])
+    with open(log, "a", encoding="utf-8") as out:
+        if os.name == "nt":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            proc = subprocess.Popen(cmd, cwd=wt, env=env, stdout=out, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, creationflags=flags)
+            pid = proc.pid
+        else:
+            # 经 sh 后台启动：进程脱离 MCP 进程组，不留僵尸，MCP 重启也不会中断索引
+            script = 'log="$1"; shift; nohup "$@" >"$log" 2>&1 </dev/null & echo $!'
+            r = subprocess.run(["/bin/sh", "-c", script, "sh", log] + cmd, cwd=wt, env=env,
+                               capture_output=True, text=True, timeout=15, start_new_session=True)
+            pid = int(r.stdout.strip().splitlines()[-1])
     with open(_index_file(cfg, name), "w", encoding="utf-8") as f:
         json.dump({"pid": pid, "commit": commit, "log": log,
                    "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)

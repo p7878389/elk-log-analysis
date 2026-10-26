@@ -124,6 +124,10 @@ CODE_TARGET_PROPS = {
     "service": {"type": "string", "description": "应用名（spring.application.name）或模块名，host 未知时使用"},
     "repo": {"type": "string", "description": "直接指定代码根目录下的仓库名"},
     "module": {"type": "string", "description": "配合 repo 指定模块相对路径"},
+    "git_url": {"type": "string", "description": "索引不存在时手动 clone 的 GitLab http(s) 地址；仅管理员可用，token 不会写入仓库配置"},
+    "access_token": {"type": "string", "description": "GitLab access token；仅用于本次 clone，通过内存环境传递，不会写入日志或 remote URL"},
+    "repo_name": {"type": "string", "description": "clone 后的本地仓库名；不传则从 git_url 文件名推断"},
+    "branch": {"type": "string", "description": "MCP 指定代码分支；有 git_url 时同时用于 clone，之后优先按此分支建立 worktree/索引；不传才使用环境默认分支"},
     "align": {"type": "string", "enum": ["deploy", "head"],
               "description": "deploy（默认）：按 pod 所属 ReplicaSet 首条日志时间取当时分支上的提交；head：分支最新"},
     "commit": {"type": "string", "description": "显式指定 commit/ref，优先于 align"},
@@ -154,7 +158,8 @@ TOOLS += [
                            ["stack"])},
     {"name": "code_prepare",
      "description": "为某环境的服务准备只读 worktree（独立目录，detached，不影响用户工作区，默认跟随分支 HEAD），"
-                    "检查 GitNexus 索引是否存在且与 worktree 一致，缺失/过期时后台增量构建。返回 worktree 路径与 gitnexus repo 名",
+                    "检查 GitNexus 索引是否存在且与 worktree 一致，缺失/过期时后台增量构建。"
+                    "索引不存在且传入 git_url/access_token 时，会先以管理员权限安全 clone GitLab 仓库，再继续准备索引。",
      "inputSchema": schema(dict(CODE_TARGET_PROPS,
                                 index={"type": "boolean", "description": "false 时不触发索引构建，默认 true"}))},
 ]
@@ -183,6 +188,16 @@ TOOLS.append(
 def handle_code_tool(name, a):
     """代码工具只读本地代码；仅在需要推断部署时间时才查询日志，生产环境仍需 confirm_production。"""
     ccfg = code.load_code_config()
+    if name == "code_prepare" and a.get("git_url"):
+        access_token = a.get("access_token") or os.environ.get("ELK_GITLAB_TOKEN")
+        if not access_token:
+            raise core.ElkError("传 git_url 时必须同时传 access_token，或在服务端 .env 配置 ELK_GITLAB_TOKEN")
+        repo_name, _ = code.clone_manual(ccfg, a["git_url"], access_token,
+                                         a.get("repo_name") or a.get("repo"), a.get("branch"))
+        a = dict(a, repo=repo_name)
+        a.pop("git_url", None)
+        a.pop("access_token", None)
+        a.pop("repo_name", None)
     if ccfg["roots"]:
         code.maybe_gc_background(ccfg)  # 闲置 worktree/索引清理：每天最多一次，后台执行
     if name == "code_services":

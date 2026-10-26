@@ -124,6 +124,8 @@ def restrict(req, user):
         return deny("工具 %s 已在服务端禁用" % name)
     if name.startswith("code_") and not user["code"]:
         return deny("当前成员（%s）的 token 没有源码查看权限，请联系 elk MCP 管理员，不要重试。" % user["name"])
+    if name == "code_prepare" and (args.get("git_url") or args.get("access_token")) and not user["admin"]:
+        return deny("手动 clone GitLab 仓库会写入服务端代码目录，仅管理员 token 可以执行。")
     if name == "code_repos" and args.get("sync") is True and not user["admin"]:
         return deny("只有管理员可以手动触发仓库同步；服务会按计划自动同步，可稍后再查看 code_repos。")
     if not user["prod"] and args.pop("confirm_production", None) is True and name.startswith("elk_") \
@@ -138,8 +140,20 @@ def restrict(req, user):
 
 
 def process(req, user):
-    if not isinstance(req, dict):
+    if (not isinstance(req, dict) or req.get("jsonrpc") != "2.0"
+            or not isinstance(req.get("method"), str)
+            or not req.get("method")
+            or ("id" in req and (isinstance(req["id"], (bool, list, dict))))):
         return mcp.reply(None, error={"code": -32600, "message": "Invalid Request"})
+    params = req.get("params", {})
+    invalid_params = not isinstance(params, dict)
+    if not invalid_params and req["method"] == "tools/call":
+        invalid_params = (not isinstance(params.get("name"), str)
+                          or not params.get("name")
+                          or not isinstance(params.get("arguments", {}), dict))
+    if invalid_params:
+        return (mcp.reply(req["id"], error={"code": -32602, "message": "Invalid params"})
+                if req.get("id") is not None else None)
     req, denied = restrict(req, user)
     if denied:
         return denied
@@ -279,7 +293,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         # 先读完请求体再做任何拒绝：keep-alive 下未读的请求体会被当成下一个请求解析
-        length = int(self.headers.get("Content-Length") or 0)
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return self._error(400, "Transfer-Encoding 不受支持，请发送 Content-Length")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0:
+                raise ValueError()
+        except ValueError:
+            self.close_connection = True
+            return self._error(400, "Content-Length 无效")
         if length > MAX_BODY:
             self.close_connection = True
             return self._error(413, "请求体过大")
@@ -300,6 +323,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return self._send(400, mcp.reply(None, error={"code": -32700, "message": "Parse error"}))
         if isinstance(req, list):
+            if not req:
+                return self._send(400, mcp.reply(None, error={"code": -32600, "message": "Invalid Request"}))
             out = [m for m in (process(r, user) for r in req) if m is not None]
             return self._send(200, out) if out else self._send(202)
         msg = process(req, user)
