@@ -45,7 +45,7 @@ FILTER_PROPS = {
                              "生产环境未按 traceId 过滤时超过 7 天会被慢查询护栏拦截"},
     "until": {"type": "string", "description": "结束时间，默认 now"},
     "level": {"type": "string", "description": "日志级别，逗号分隔，如 ERROR,WARN"},
-    "service": {"type": "string", "description": "应用名，逗号分隔"},
+    "service": {"type": "string", "description": "应用名，逗号分隔；按 fields.service 映射过滤。映射为 Pod keyword 字段时匹配应用名或应用名-前缀；可用 elk_fields 核对字段"},
     "host": {"type": "string",
              "description": "主机/Pod，逗号分隔可多个；支持 前缀*（如 equipment-apply-manage*）与 *片段*，"
                             "作用于 keyword 子字段，比在 query 里写 host.name:*x* 快得多"},

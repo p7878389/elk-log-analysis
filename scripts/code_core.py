@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import fcntl
@@ -339,11 +340,15 @@ def catalog(cfg):
     """代码根目录下所有仓库的「应用名 ↔ 仓库/模块」清单（进程内缓存 10 分钟）。"""
     def build():
         entries = []
-        for name, repo in repo_map(cfg).items():
+        def scan(item):
+            name, repo = item
             try:
-                entries.extend(_scan_repo(name, repo))
+                return _scan_repo(name, repo)
             except core.ElkError:
-                continue
+                return []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for result in pool.map(scan, repo_map(cfg).items()):
+                entries.extend(result)
         return entries
     return _memo(("catalog", tuple(cfg["roots"])), 600, build)
 

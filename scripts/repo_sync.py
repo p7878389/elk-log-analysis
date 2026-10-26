@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -248,11 +249,11 @@ def _sync_one(scfg, p, manifest):
     managed = str(p["id"]) in manifest["projects"]
     with code._Lock(scfg["code"], "repo-" + p["dir"]):
         if not os.path.exists(path):
-            tmp = os.path.join(scfg["dir"], ".%s.cloning" % p["dir"])
-            if os.path.exists(tmp):
-                shutil.rmtree(tmp, ignore_errors=True)
+            # A killed clone may leave read-only pack files on Windows. Use
+            # a fresh staging directory rather than reusing that residue.
+            tmp = tempfile.mkdtemp(prefix=".%s.cloning-" % p["dir"], dir=scfg["dir"])
             # blob:none：只下载提交与目录树，文件内容在检出/查看时按需获取，几十个仓库也只占少量磁盘
-            r = code.git(scfg["dir"], "clone", "--filter=blob:none", "--no-tags", p["url"], tmp,
+            r = code.git(scfg["dir"], "-c", "core.longpaths=true", "clone", "--filter=blob:none", "--no-tags", p["url"], tmp,
                          timeout=1800, check=False)
             if r.returncode != 0:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -393,7 +394,10 @@ def _run_sync(scfg, index, say):
     lock = threading.Lock()
 
     def one(p):
-        action, err = _sync_one(scfg, p, manifest)
+        try:
+            action, err = _sync_one(scfg, p, manifest)
+        except (OSError, core.ElkError) as exc:
+            action, err = None, str(exc)[:300]
         with lock:
             if err:
                 report["failed"].append({"repo": p["path_with_namespace"], "error": err})
@@ -537,6 +541,13 @@ def describe(scfg, grep=None):
     items = sorted((v["dir"], v["path"]) for v in m.values())
     if grep:
         items = [i for i in items if grep.lower() in (i[0] + " " + i[1]).lower()]
-    lines.append("\n# 已同步仓库（%d）" % len(items))
+    lines.append("\n# 自动管理的仓库（%d；同步时允许重置工作区）" % len(items))
     lines += ["%-36s %s" % i for i in items[:300]]
+    managed = {os.path.realpath(os.path.join(scfg["dir"], v["dir"])) for v in m.values()}
+    existing = [(n, p) for n, p in code.repo_map(scfg["code"]).items()
+                if os.path.realpath(p) not in managed]
+    if grep:
+        existing = [(n, p) for n, p in existing if grep.lower() in (n + " " + p).lower()]
+    lines.append("\n# 已有本地仓库（%d；不重置工作区，仅同步远程引用）" % len(existing))
+    lines += ["%-36s %s" % item for item in existing[:300]]
     return "\n".join(lines)

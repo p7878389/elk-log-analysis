@@ -55,6 +55,17 @@ def prepare(env, args, tz):
             reject()
         body['query'] = {'bool': {'must': [query], 'filter': [{'range': {
             env['_fields']['timestamp']: {'gte': start.isoformat(), 'lte': end.isoformat()}}}]}}
+    elif args.get('since') is not None or args.get('until') is not None:
+        now = datetime.now(timezone.utc)
+        try:
+            start = _instant(args.get('since') or '15m', tz, now)
+            end = _instant(args.get('until') or 'now', tz, now)
+        except (ValueError, TypeError, OverflowError):
+            raise core.ElkError('since/until 不是有效的时间范围')
+        if (end - start).total_seconds() < 0:
+            raise core.ElkError('since 不能晚于 until')
+        body['query'] = {'bool': {'must': [body.get('query', {'match_all': {}})], 'filter': [{'range': {
+            env['_fields']['timestamp']: {'gte': start.isoformat(), 'lte': end.isoformat()}}}]}}
     if api == '_search':
         body['size'] = max(0, min(int(body.get('size', 50)), int(env.get('max_size', 500))))
         cap = max(1, min(int(env.get('search_timeout', 25)), int(env.get('timeout', 60))-5))

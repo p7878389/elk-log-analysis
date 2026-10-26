@@ -185,11 +185,14 @@ class Report:
 
 def _guard(r, name, fn, *args):
     """单项检查自身出错时记为 FAIL，不影响其他检查。"""
+    started = time.monotonic()
     try:
         fn(r, *args)
     except Exception as e:  # noqa: BLE001
         r.failed("检查「%s」自身出错：%s（%s）" % (name, e, exc_where(e) or "-"),
                  action="属于 doctor 代码缺陷，请让 Claude 修复")
+    finally:
+        r.info("检查「%s」耗时 %.2fs" % (name, time.monotonic() - started))
 
 
 # ---------------------------------------------------------------- 检查项
@@ -414,8 +417,19 @@ def check_service_mapping(r, ctx):
 
 
 def _registered_worktrees(repo):
-    out = code.git(repo, "worktree", "list", "--porcelain", check=False).stdout
-    return [line[len("worktree "):] for line in out.splitlines() if line.startswith("worktree ")]
+    # The admin files already contain every linked worktree location. Spawning
+    # git once for each of hundreds of repositories dominated doctor latency.
+    gitdir = os.path.join(repo, ".git")
+    if not os.path.isdir(gitdir):
+        return []
+    paths = []
+    for path in glob.glob(os.path.join(gitdir, "worktrees", "*", "gitdir")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                paths.append(os.path.dirname(f.read().strip()))
+        except OSError:
+            continue
+    return paths
 
 
 def check_cache(r, ctx):
@@ -512,7 +526,25 @@ def check_processes(r, ctx):
     r.sec("MCP 进程与代码版本")
     script = os.path.join(SCRIPTS_DIR, "mcp_server.py")
     code_mtime = _code_mtime()
-    pids = subprocess.run(["pgrep", "-f", script], capture_output=True, text=True).stdout.split()
+    if os.name == "nt":
+        try:
+            ps = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                 "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                                 "Where-Object { $_.CommandLine -like '*mcp_http.py*' -or $_.CommandLine -like '*mcp_server.py*' } | "
+                                 "Select-Object ProcessId,@{Name='Started';Expression={([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds()}} | ConvertTo-Json -Compress"],
+                                capture_output=True, text=True, timeout=10)
+            records = json.loads(ps.stdout or "[]")
+            records = records if isinstance(records, list) else [records]
+        except (OSError, subprocess.TimeoutExpired):
+            r.warn("Windows 进程检查超时或不可用")
+            return
+        r.ok("运行中的 elk MCP 进程 %d 个" % len(records))
+        old = [str(p["ProcessId"]) for p in records if p.get("Started", 0) < code_mtime]
+        if old:
+            r.warn("进程运行的是旧代码：%s" % ", ".join(old), action="重启 MCP 服务")
+        return
+    else:
+        pids = subprocess.run(["pgrep", "-f", script], capture_output=True, text=True, timeout=10).stdout.split()
     if not pids:
         r.info("当前没有运行中的 elk MCP 进程")
         return
@@ -520,7 +552,11 @@ def check_processes(r, ctx):
     for pid in pids:
         started = _proc_start(pid)
         if started is not None and started < code_mtime:
-            ppid = subprocess.run(["ps", "-o", "ppid=", "-p", pid], capture_output=True, text=True).stdout.strip()
+            ppid = (subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    "(Get-CimInstance Win32_Process -Filter \"ProcessId=%s\").ParentProcessId" % pid],
+                                   capture_output=True, text=True, timeout=10).stdout.strip()
+                    if os.name == "nt" else
+                    subprocess.run(["ps", "-o", "ppid=", "-p", pid], capture_output=True, text=True, timeout=10).stdout.strip())
             old.append("pid %s（父进程 %s，启动于 %s）%s" % (
                 pid, ppid, datetime.fromtimestamp(started).strftime("%m-%d %H:%M"),
                 " ← 当前会话" if int(pid) == os.getpid() else ""))
@@ -607,8 +643,11 @@ def check_logs(r, ctx, days):
             if d.get("cat") == "internal" or d.get("where"):
                 internal.setdefault(d.get("where") or "?", d)
         for where, d in internal.items():
-            r.failed("MCP 代码缺陷：%s 在 %s 抛出：%s" % (d["tool"], where, d.get("err", "")[:160]),
-                     action="让 Claude 按位置修复代码，修复后用 git diff 审阅（skill 目录已纳入 git）")
+            message = "MCP 代码缺陷：%s 在 %s 抛出：%s" % (d["tool"], where, d.get("err", "")[:160])
+            if _epoch(d.get("ts", "")) < _code_mtime():
+                r.info(message + "（发生于当前代码版本之前，需观察是否复现）")
+            else:
+                r.failed(message, action="让 Claude 按位置修复代码，修复后用 git diff 审阅（skill 目录已纳入 git）")
         _summarize(r, "mcp.log", [(d["ts"], d["tool"], d.get("err", "")) for d in fails
                                   if d.get("cat") != "internal" and not d.get("where")], days)
     else:

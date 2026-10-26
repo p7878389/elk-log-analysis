@@ -34,6 +34,19 @@ class DslGuard(unittest.TestCase):
     def test_nonproduction_preserves_query(self):
         self.assertEqual(self.invoke({'query':{'match_all':{}}},production=False)['query'],{'match_all':{}})
 
+    def test_nonproduction_applies_explicit_time_range(self):
+        body = self.invoke({'query': {'match_all': {}}}, production=False, since='15m')
+        self.assertIn('filter', body['query']['bool'])
+        self.assertIn('@timestamp', body['query']['bool']['filter'][0]['range'])
+
+    def test_count_nonproduction_honors_window(self):
+        body = self.invoke({}, production=False, api='_count', since='15m')
+        self.assertIn('@timestamp', body['query']['bool']['filter'][0]['range'])
+
+    def test_nonproduction_reversed_window_rejected(self):
+        with self.assertRaises(core.ElkError):
+            self.invoke({}, production=False, since='1m', until='2m')
+
     def test_count_also_guarded(self):
         with self.assertRaises(core.ElkError): self.invoke({},api='_count',since='30d')
 

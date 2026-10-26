@@ -731,6 +731,16 @@ def _host_clause(f, value):
     return {"wildcard": {field: value}}
 
 
+def _service_clause(f, value):
+    field = f["service"]
+    if field not in ("fields.pod_name.keyword", "host.name.keyword"):
+        return {"match_phrase": {field: value}}
+    if "*" not in value and "?" not in value:
+        return {"bool": {"should": [{"term": {field: value}},
+                                    {"prefix": {field: value + "-"}}], "minimum_should_match": 1}}
+    return {"wildcard": {field: value}}
+
+
 def _span_days(p, tz):
     """since~until 的跨度（天）；无法解析（ES date math 等）时返回 None。"""
     now = datetime.now(timezone.utc)
@@ -787,7 +797,7 @@ def build_query(env, p, tz):
         if v:
             values = [x.strip() for x in str(v).split(",") if x.strip()]
             filt.append({"bool": {"should": [
-                _host_clause(f, x) if k == "host" else {"match_phrase": {f[k]: x}} for x in values],
+                _host_clause(f, x) if k == "host" else (_service_clause(f, x) if k == "service" else {"match_phrase": {f[k]: x}}) for x in values],
                 "minimum_should_match": 1}})
     for k, v in (p.get("terms") or {}).items():
         filt.append({"match_phrase": {k: v}})
@@ -991,6 +1001,8 @@ def op_agg(env, p, tz, interactive=True):
         note = "# 注: %s 是 text 字段，已自动改用 %s.keyword" % (field, field)
         _healed("agg_text_field_keyword", field)
     lines = ["# env=%s total=%s" % (env["_name"], _total(res))]
+    if p.get("field") == "service" and env["_fields"]["service"] in ("fields.pod_name.keyword", "host.name.keyword"):
+        lines.append("# service 映射到 Pod 名，以下按 Pod 分组（含副本后缀）")
     for n in (note, _partial_note(env, res)):
         if n:
             lines.append(n)
