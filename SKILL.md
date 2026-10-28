@@ -45,6 +45,7 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 3. **看明细**：`elk_search {level:"ERROR", query:"...", size:20}`；需要堆栈时 `full:true, size:3~5`。
 4. **串链路**：从代表性错误取 traceId → `elk_trace {trace_id:"..."}`。
 5. **对照代码**（日志不足以下结论时必做，见第 3 节）。
+   - 根因取决于业务数据（状态、余额、配置、重复数据等）时，若已安装 `yearning-query` skill，按其「与 ELK 日志排查联动」一节，用日志中的业务 ID 经 Yearning 只读查询核对；环境与日志保持一致，查生产库同样需要用户明确要求。
 6. **输出结论**：环境与时间范围、影响量级（条数/趋势）、根因、证据（精简日志片段 + 代码位置与 commit）、修复建议。
 
 ## 3. 从日志到代码
