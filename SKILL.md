@@ -23,7 +23,7 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 | `code_repos` | GitLab 仓库同步状态与已同步仓库清单；找不到仓库时先看这里（`sync:true` 手动同步，团队服务中仅管理员可用） |
 | `elk_doctor` | 自检：配置/凭据、连通性与字段、依赖、服务映射覆盖率、缓存与索引健康、MCP 进程是否跑旧代码、近 N 天日志错误分类；`fix:true` 只修复缓存/运行时状态 |
 
-- 工具名在 Claude Code 中为 `mcp__elk__<tool>`；若工具未加载，先用 ToolSearch 搜索 `elk`。
+- 工具名取决于 MCP 条目名：连接团队远程服务时为 `mcp__elk-mcp__<tool>`，本机部署为 `mcp__elk__<tool>`；以会话中实际存在的为准，若工具未加载，先用 ToolSearch 搜索 `elk`。
 - **MCP 不可用时**才退回命令行：`python3 ~/.claude/skills/elk-log-analysis/scripts/elk.py -e <env> <search|trace|agg|fields|...>`，参数同名（`--help` 查看）。
 - 环境配置：统一在 **cc-switch** 中管理——elk MCP 条目顶层的 `elk` 字段（JSON 对象：`default_env`、`defaults`、`fields`、`environments` 数组，每项一个环境：env/url/username/password/index…），服务启动时直接从 `~/.cc-switch/cc-switch.db` 只读读取。**不要**把它放进 `env`：env 的值只能是字符串，Claude Code 会跳过整个 elk 服务，cc-switch 同步 Codex 时也会丢弃。MCP env 中的 `ELK_ENVIRONMENTS` / 平铺 `ELK_ENVS` + `ELK_<ENV>_*` 仍兼容且优先；`~/.config/elk-log-analysis/envs.json` 为最后兜底。配置是**分层**的——环境项 > 全局（`defaults` / `ELK_<KEY>`）> 环境级别预设（按名称识别 dev/test/staging/prod，决定生产保护、代码分支、版本对齐）> 内置默认。`elk_envs {verbose:true}` 可以查看每项配置的来源，详见 `references/mcp-config.md`。用户要新增或修改环境、索引、密码时指引其在 cc-switch 界面编辑 elk MCP 的 JSON，**不要由 Claude 代填密码**。
 - 排序：明细默认按 `time.keyword` **升序**（取时间窗口内最早 N 条）；要看最新 N 条传 `desc: true`（展示仍为升序）。`since/until` 时间范围过滤与趋势聚合仍使用 `@timestamp`（date 类型）。
@@ -49,6 +49,8 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 
 ## 3. 从日志到代码
 
+> 连接的是远程（团队共享）服务时，本节的 worktree 路径都在服务器上，先读第 6 节：不要在本机 Read/Grep 这些路径，读源码用 `code_locate` 片段，调用链用 `gitnexus-remote` 并传 `code_prepare` 返回的 `repo`。
+
 代码来自 `ELK_CODE_ROOT` 中配置的仓库（可以有多个目录，逗号分隔，如 `~/code,~/work`；跨目录重名的仓库名为 `<上级目录名>_<仓库名>`，`repo` 参数也可以直接传绝对路径），**不看当前会话所在仓库的工作区**，因为那里的分支和版本未必与环境一致。
 
 1. **识别服务**：`host.name` 是 k8s pod 名 `<deployment>-<rs哈希>-<pod后缀>`。一个仓库常含多个服务模块（如 order-platform 下的 order-business、order-gateway 等），按 `spring.application.name` / 模块目录名精确到模块。变体部署按前缀归并（`order-gateway-hw` 归到 `order-gateway`），多了公司前缀的按后缀匹配（`crm-manager` 对应 `acme-crm-manager`）。映射不到时，工具会给出相近名称；确认后可让用户在 `ELK_CODE_SERVICE_MAP` 中配置，或直接传 `repo`/`module`。
@@ -61,8 +63,8 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
      - 模块无改动：模块内调用链可以直接使用。
      - 模块有改动、且结论依赖这些改动：传 `exact: true`，按部署 commit 单独建一份 worktree 和索引（repo 名为 `<仓库>@<commit前10位>`，约 30 秒～数分钟，多占一份磁盘，闲置 3 天后自动清理）。
    - 闲置的 worktree 和索引会自动清理（分支副本 10 天、按 commit 的副本 3 天），下次用到时自动重建（约 2 秒建副本、30 秒左右建索引），不需要人工处理。
-   - 索引状态为“最新”：调用 gitnexus 工具（`query`/`context`/`impact`）时传入该 `repo`。
-   - 状态为“构建中”（大仓库首次约 30 秒～数分钟）：先用 Read/Grep 读 worktree，稍后再次调用 `code_prepare` 查看状态。
+   - 索引状态为“最新”：调用 gitnexus 工具（`query`/`context`/`impact`）时传入该 `repo`；远程模式用 `gitnexus-remote`，不要把该 `repo` 传给本机 GitNexus。
+   - 状态为“构建中”（大仓库首次约 30 秒～数分钟）：先读源码（本机模式用 Read/Grep 读 worktree，远程模式用 `code_locate`），稍后再次调用 `code_prepare` 查看状态。
    - 状态为“失败”：查看输出里的日志路径，并告知用户。
 5. **只读约束**：worktree 位于 `~/.cache/elk-log-analysis/worktrees/<仓库>@<分支>`，是 detached 的只读副本，**禁止在其中修改、提交或切分支**。要修复问题时，回到用户自己的仓库和分支，并先征得用户同意。工具不会动用户工作区，只会执行 `git fetch`（更新 origin/* 远程引用，10 分钟节流）。
 
