@@ -147,9 +147,12 @@ def choose_transport(scfg, projects):
     return projects
 
 
-def list_projects(scfg):
-    """令牌可见的项目（排除归档、空仓库、仓库功能关闭的项目，以及 ELK_GITLAB_EXCLUDE 命中的项目）。"""
+def list_projects(scfg, search=None):
+    """令牌可见的项目（排除归档、空仓库、仓库功能关闭的项目，以及 ELK_GITLAB_EXCLUDE 命中的项目）。
+    search 只取名称/路径包含该关键字的项目（GitLab 服务端过滤），供按需 clone 使用。"""
     base = {"archived": "false", "order_by": "id", "sort": "asc"}
+    if search:
+        base["search"] = search
     if scfg["groups"]:
         raw = []
         for g in scfg["groups"]:
@@ -280,6 +283,39 @@ def _sync_one(scfg, p, manifest):
             manifest["projects"][str(p["id"])] = {"dir": p["dir"], "path": p["path_with_namespace"],
                                                   "url": p["url"]}
         return action, None
+
+
+def clone_on_demand(scfg, name):
+    """code_* 指定的仓库不在代码目录时立即 clone，不等下一次定时同步；返回仓库目录名。
+    与定时同步共用凭据、拉取协议、排除规则、目录命名与清单，因此只会 clone 同步范围内的项目。
+    name 可以是项目 path（check-poct）或完整路径（group/sub/check-poct），在同步范围内唯一匹配才 clone。"""
+    bad = gitlab_auth.problem(scfg["auth"])
+    if bad:
+        raise core.ElkError(bad)
+    if not scfg["dir"]:
+        raise core.ElkError("未配置同步目录：请设置 ELK_CODE_ROOT 或 ELK_REPO_SYNC_DIR")
+    if _RUN_LOCK.locked():
+        raise core.ElkError("仓库 %s 不在代码目录，且定时同步正在进行中，同步完成后再试" % name)
+    check_login(scfg)
+    want = name.strip("/").lower()
+    hits = [p for p in list_projects(scfg, search=want.rsplit("/", 1)[-1])
+            if want in (p["path"].lower(), p["path_with_namespace"].lower())]
+    if not hits:
+        raise core.ElkError("代码目录和 GitLab 同步范围内都没有仓库 %s（code_repos 可查看同步范围）" % name)
+    if len(hits) > 1:
+        raise core.ElkError("GitLab 上有多个项目叫 %s，请传完整路径：%s"
+                            % (name, ", ".join(p["path_with_namespace"] for p in hits)))
+    os.makedirs(scfg["dir"], exist_ok=True)
+    with code._Lock(scfg["code"], "repo-sync"):  # 与定时同步（含其他进程）互斥，清单读写不交错
+        manifest = _load_manifest(scfg)
+        p = plan_dirs(scfg, choose_transport(scfg, hits), manifest)[0]
+        action, err = _sync_one(scfg, p, manifest)
+        if err:
+            raise core.ElkError("按需 clone %s 失败：%s" % (p["path_with_namespace"], err))
+        _save_manifest(scfg, manifest)
+    code._MEMO.clear()  # 新仓库立即可被 code_* 发现
+    _log(scfg, "+ 按需%s %s → %s" % ("clone" if action == "cloned" else "接管", p["path_with_namespace"], p["dir"]))
+    return p["dir"]
 
 
 # ---------------------------------------------------------------- GitNexus 预建索引

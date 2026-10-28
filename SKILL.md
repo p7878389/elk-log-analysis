@@ -97,6 +97,6 @@ elk MCP 也可以作为 HTTP 服务部署在服务器上供团队共用（部署
 - **代码来自服务端**：服务端定时从 GitLab 同步仓库。`code_locate` 返回的代码片段可以直接使用；worktree 路径指的是服务器上的目录，**不要尝试在本机读取**。
 - **调用链、影响面**：如果已连接 `gitnexus-remote`（服务端的 GitNexus），先用 `code_prepare` 拿到 `repo` 名（如 `order-platform@master`），再用 `gitnexus-remote` 的 `query`/`context`/`impact` 等工具，并传入这个 `repo`。索引状态为「构建中」时稍后再查。没有连接 `gitnexus-remote` 时，改在用户本机的仓库中分析。
 - **服务端 GitNexus 只读**：`rename` 等会改写代码的工具会被拒绝。需要重构时，回到用户本机的仓库操作。
-- **找不到仓库或服务**：先调用 `code_repos` 看同步状态。新建的仓库可能还没同步到，告诉用户等下一次同步，或请管理员手动触发（`code_repos sync:true` 只有管理员可用）。
+- **找不到仓库或服务**：知道仓库名时直接给 `code_locate` / `code_prepare` 传 `repo`（项目名或 `group/项目` 完整路径）。服务端配置了 GitLab 同步时，会按同步时用的协议（SSH 不通则走 HTTPS）立即 clone 同步范围内唯一匹配的项目，不用等下一次定时同步；索引缺失时 `code_prepare` 会在后台构建。只知道服务名或按需 clone 报错时，再调用 `code_repos` 看同步状态，并把报错转告用户（重名项目要传完整路径；同步范围外的项目需要管理员处理）。
 - **权限不足时不要重试**：返回“没有生产环境权限”或“没有源码查看权限”时，转告用户联系 elk MCP 管理员开通即可。
 - **自检对象是服务端**：`elk_doctor` 检查的是服务端的配置与缓存，`fix:true` 只有管理员 token 才会生效。配置、凭据或同步问题请转告管理员，不要让用户去改本机的 cc-switch。
