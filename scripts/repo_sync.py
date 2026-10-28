@@ -19,7 +19,6 @@
 import fnmatch
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -256,7 +255,7 @@ def _sync_one(scfg, p, manifest):
             r = code.git(scfg["dir"], "-c", "core.longpaths=true", "clone", "--filter=blob:none", "--no-tags", p["url"], tmp,
                          timeout=1800, check=False)
             if r.returncode != 0:
-                shutil.rmtree(tmp, ignore_errors=True)
+                code.rmtree_force(tmp)
                 return None, _git_err(r)
             os.rename(tmp, path)
             action, managed = "cloned", True

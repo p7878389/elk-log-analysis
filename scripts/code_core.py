@@ -11,7 +11,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -183,6 +185,25 @@ def _fmt_epoch(sec, tz):
     return datetime.fromtimestamp(sec, timezone.utc).astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def rmtree_force(path):
+    """删除目录树，失败不抛异常。Windows 上 git 的 pack/idx 是只读文件，shutil.rmtree 删不掉，
+    ignore_errors 又会静默留下整个目录；这里先去掉只读属性（连同所在目录）再重试。"""
+    def retry(func, p, _exc):
+        for target in (os.path.dirname(p), p):
+            try:
+                os.chmod(target, stat.S_IRWXU)
+            except OSError:
+                pass
+        try:
+            func(p)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=retry)
+
+
 # ---------------------------------------------------------------- service catalog
 
 def _is_repo(path):
@@ -240,7 +261,7 @@ def clone_manual(cfg, url, access_token, name=None, branch=None):
         raise core.ElkError("目标路径已存在且不是 Git 仓库：%s" % target)
     os.makedirs(root, exist_ok=True)
     tmp = os.path.join(root, ".%s.manual-cloning" % repo_name)
-    shutil.rmtree(tmp, ignore_errors=True)
+    rmtree_force(tmp)
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
                GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
                GIT_CONFIG_VALUE_0="PRIVATE-TOKEN: %s" % str(access_token).strip())
@@ -251,10 +272,10 @@ def clone_manual(cfg, url, access_token, name=None, branch=None):
     try:
         r = subprocess.run(cmd, cwd=root, env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
     except subprocess.TimeoutExpired:
-        shutil.rmtree(tmp, ignore_errors=True)
+        rmtree_force(tmp)
         raise core.ElkError("GitLab clone 超时（1800s）")
     if r.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
+        rmtree_force(tmp)
         detail = (r.stderr or r.stdout or "").strip().splitlines()
         detail = next((x.strip() for x in detail if x.strip().lower().startswith(("fatal:", "remote:", "error:"))), "未知错误")
         raise core.ElkError("GitLab clone 失败：%s" % detail[:400])

@@ -1,4 +1,5 @@
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,34 @@ class DiagnosticsAndMapping(unittest.TestCase):
                 self.assertEqual(repo_sync._sync_one(cfg, project, {'projects': {}}), ('cloned', None))
             self.assertTrue((root / 'sample' / '.git').is_dir())
             self.assertEqual((old / 'residue').read_text(), 'keep')
+
+    def test_failed_clone_removes_read_only_staging_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            cfg = {'dir': str(root), 'code': {'cache': str(root / 'cache')}}
+            project = {'dir': 'sample', 'id': 1, 'url': 'https://gitlab.invalid/group/sample.git',
+                       'default_branch': '', 'path_with_namespace': 'group/sample'}
+
+            def git(cwd, *args, **kwargs):
+                if 'clone' in args:
+                    pack = pathlib.Path(args[-1]) / '.git' / 'objects' / 'pack'
+                    pack.mkdir(parents=True)
+                    (pack / 'pack-1.pack').write_text('x')
+                    # Windows 上 git 的 pack 文件只读；这里同时把目录设为只读，让非 Windows 平台上的普通删除也失败
+                    (pack / 'pack-1.pack').chmod(stat.S_IREAD)
+                    pack.chmod(stat.S_IREAD | stat.S_IEXEC)
+                    return subprocess.CompletedProcess(args, 128, '', 'fatal: unable to checkout working tree')
+                raise AssertionError(args)
+
+            try:
+                with patch.object(repo_sync.code, 'git', side_effect=git):
+                    action, err = repo_sync._sync_one(cfg, project, {'projects': {}})
+                self.assertIsNone(action)
+                self.assertIn('unable to checkout working tree', err)
+                self.assertEqual([p.name for p in root.iterdir() if '.cloning' in p.name], [])
+            finally:
+                for pack in root.glob('.sample.cloning-*/.git/objects/pack'):
+                    pack.chmod(stat.S_IRWXU)  # 修复前的残留也要能被 TemporaryDirectory 清理
 
 
 if __name__ == '__main__':
