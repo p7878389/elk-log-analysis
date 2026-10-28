@@ -58,7 +58,7 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 3. **定位**：`code_locate {host, stack}`，`stack` 直接取 `elk_search full:true` 输出的异常段。不知道 host 时只传 `stack`，工具会按帧推断仓库/模块。输出“行号超出文件长度”说明版本不一致，此时改用 `align:"head"` 或指定 `commit` 复核。
 4. **深入分析**（调用链、影响面、同类问题）：`code_prepare {host}` 会返回 worktree 路径和 gitnexus `repo` 名（如 `order-platform@beta`）。
    - **worktree/索引默认跟随分支 HEAD**，同一分支的所有服务共用一份，只在分支有新提交时增量更新。精确行号仍以 `code_locate` 为准，它按部署版本用 git show 读取。
-   - **使用中不推进**：副本在 30 分钟内（`ELK_CODE_LEASE`）被 `code_prepare` 用过时，即使分支有新提交也保持原提交，避免同一分支上正在进行的分析（包括其他会话）读到的文件和调用链中途变化。空闲超过这个时间后，下一次调用时自动推进。确实需要最新代码时传 `refresh: true`。长时间分析时，中途可以再调一次 `code_prepare` 来续期。
+   - **使用中不推进**：副本在 30 分钟内（`ELK_CODE_LEASE`）被 `code_prepare` 用过时，即使分支有新提交也保持原提交，避免同一分支上正在进行的分析（包括其他会话）读到的文件和调用链中途变化。空闲超过这个时间后，下一次调用时自动推进。确实需要最新代码时传 `refresh: true`。远程（团队共享）服务还会每 30 分钟（`ELK_CODE_REFRESH_INTERVAL`）以及每次仓库同步后，把已有的分支副本推进到远程最新并增量更新索引，常用的分支通常已经是最新的。长时间分析时，中途可以再调一次 `code_prepare` 来续期。
    - 输出会说明副本实际所在的提交，与部署版本、分支 HEAD 各差几个提交，以及**其中有几个改动了该模块**：
      - 模块无改动：模块内调用链可以直接使用。
      - 模块有改动、且结论依赖这些改动：传 `exact: true`，按部署 commit 单独建一份 worktree 和索引（repo 名为 `<仓库>@<commit前10位>`，约 30 秒～数分钟，多占一份磁盘，闲置 3 天后自动清理）。

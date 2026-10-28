@@ -60,6 +60,7 @@ def load_code_config(environ=None):
     """ELK_CODE_ROOT 代码根目录（多个用逗号或冒号分隔；每项可以是仓库的父目录，也可以直接是仓库）；ELK_CODE_BRANCHES 环境→分支(JSON)；ELK_CODE_SERVICE_MAP 服务→仓库[/模块](JSON)；
     ELK_CODE_CACHE 缓存目录；ELK_CODE_FETCH_TTL fetch 节流秒数；ELK_CODE_LEASE worktree 使用中不推进的秒数；
     ELK_CODE_GC_DAYS / ELK_CODE_GC_EXACT_DAYS 分支/按 commit 的 worktree 闲置多少天后清理（0 关闭）；ELK_CODE_AUTO_INDEX 是否自动建索引；
+    ELK_CODE_REFRESH_INTERVAL HTTP 服务定时把已有分支 worktree 推进到远程最新并增量更新索引的间隔秒数（默认 1800，0 关闭）；
     ELK_CODE_GITNEXUS gitnexus 可执行文件或安装目录（不设则自动检测）；ELK_CODE_NODE 运行 gitnexus 的 node。"""
     environ = os.environ if environ is None else environ
     # 分隔符：逗号、换行、系统路径分隔符（Windows 为 ; 以免拆开 C:\ 盘符）
@@ -85,6 +86,7 @@ def load_code_config(environ=None):
         "gc_days": float(environ.get("ELK_CODE_GC_DAYS") or 10),
         "gc_exact_days": float(environ.get("ELK_CODE_GC_EXACT_DAYS") or 3),
         "auto_index": core._bool(environ.get("ELK_CODE_AUTO_INDEX"), True),
+        "refresh_interval": int(environ.get("ELK_CODE_REFRESH_INTERVAL") or 1800),
         "gitnexus_spec": environ.get("ELK_CODE_GITNEXUS") or "",
         "gitnexus_node": environ.get("ELK_CODE_NODE") or "",
     }
@@ -746,11 +748,37 @@ def _touch_lease(cfg, name):
     os.utime(_lease_file(cfg, name), None)
 
 
-def ensure_worktree(cfg, info, ctx, want_index=True, exact=False, refresh=False):
+def _source_file(cfg, name):
+    return os.path.join(_cache_dir(cfg, "worktree-source"), name + ".json")
+
+
+def worktree_source(cfg, name, wt):
+    """分支 worktree 对应的 (主仓库路径, 分支)，供定时刷新使用；按 commit 的 worktree 或无法确定时返回 None。
+    分支名在 worktree 名称里可能被转义（feature/x → feature-x-<摘要>），所以以 ensure_worktree 记下的来源为准；
+    早于该记录的 worktree 退回到 git-common-dir + 名称后缀，后缀不是真实远程分支时放弃。"""
+    if EXACT_SUFFIX.search(name):
+        return None
+    try:
+        with open(_source_file(cfg, name), encoding="utf-8") as f:
+            src = json.load(f)
+        return src["repo_path"], src["branch"]
+    except (OSError, ValueError, KeyError):
+        pass
+    r = git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    common = r.stdout.strip() if r.returncode == 0 else ""
+    if not os.path.isdir(common):
+        return None
+    repo_path = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    branch = name.rsplit("@", 1)[-1]
+    return (repo_path, branch) if _ref_exists(repo_path, "refs/remotes/origin/" + branch) else None
+
+
+def ensure_worktree(cfg, info, ctx, want_index=True, exact=False, refresh=False, touch=True):
     """独立只读 worktree（detached）检出到分支 HEAD（exact 时为部署 commit），并按需触发 GitNexus 增量索引。
 
     使用中不推进：worktree 在 ELK_CODE_LEASE 秒内被 code_prepare 用过时，即使分支有新提交也保持原 commit，
     避免同一分支上正在进行的分析（可能在其他会话）读到的文件/调用链中途变化；refresh=True 强制推进。
+    touch=False 时不记为“使用”（定时刷新用），不影响使用中判断与闲置清理。
     返回 (worktree 路径, 名称, 索引状态, 说明, worktree 实际 commit)。"""
     name = worktree_name(info, ctx, exact)
     wt = os.path.join(_cache_dir(cfg, "worktrees"), name)
@@ -785,7 +813,14 @@ def ensure_worktree(cfg, info, ctx, want_index=True, exact=False, refresh=False)
             notes.append("已在后台%s GitNexus 索引（pid %d）" % (
                 "增量更新" if st["state"] == "stale" else "构建", pid))
             st = index_state(cfg, wt, name)
-        _touch_lease(cfg, name)
+        if worktree_target(ctx, exact)[1] == safe_ref(ctx["branch"]):  # 分支 worktree：记下来源供定时刷新
+            try:
+                with open(_source_file(cfg, name), "w", encoding="utf-8") as f:
+                    json.dump({"repo_path": info["repo_path"], "branch": ctx["branch"]}, f, ensure_ascii=False)
+            except OSError:
+                pass
+        if touch:
+            _touch_lease(cfg, name)
     return wt, name, st, notes, wt_sha
 
 

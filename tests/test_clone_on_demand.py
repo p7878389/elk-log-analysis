@@ -95,6 +95,23 @@ class CloneOnDemand(unittest.TestCase):
         self.assertTrue((self.root / 'sample' / '.git').is_dir())
         self.assertEqual(list(self.root.glob('.sample.cloning-*')), [])
 
+    def test_then_runs_only_after_successful_clone(self):
+        done = []
+
+        def fail(cwd, *args, **kwargs):
+            return subprocess.CompletedProcess(args, 128, '', 'fatal: denied')
+
+        with patch.object(repo_sync, 'list_projects', return_value=[project(7, 'group/sample')]), \
+                patch.object(repo_sync.threading, 'Thread', ImmediateThread):
+            with patch.object(repo_sync.code, 'git', side_effect=fail):
+                repo_sync.clone_on_demand(self.scfg, 'sample', done.append)
+            self.assertEqual(done, [])
+            with self.assertRaises(core.ElkError):  # 失败报告一次
+                repo_sync.clone_on_demand(self.scfg, 'sample', done.append)
+            with patch.object(repo_sync.code, 'git', side_effect=self.clone):
+                repo_sync.clone_on_demand(self.scfg, 'sample', done.append)
+        self.assertEqual(done, ['sample'])
+
     def test_same_name_in_two_groups_requires_full_path(self):
         found = [project(1, 'group-a/sample'), project(2, 'group-b/sample')]
         with patch.object(repo_sync, 'list_projects', return_value=found), \
@@ -126,8 +143,19 @@ class MissingRepoHook(unittest.TestCase):
                 patch.object(mcp_server.repo_sync, 'load_sync_config', return_value={'dir': '/code'}), \
                 patch.object(mcp_server.repo_sync, 'clone_on_demand', return_value='已开始后台 clone') as clone:
             with self.assertRaisesRegex(core.ElkError, '已开始后台 clone'):
-                mcp_server._clone_missing_repo({}, {'repo': 'group/sample', 'env': 'test'})
-        clone.assert_called_once_with({'dir': '/code'}, 'group/sample')
+                mcp_server._clone_missing_repo({}, {'repo': 'group/sample', 'env': 'test'}, 'code_locate')
+        clone.assert_called_once_with({'dir': '/code'}, 'group/sample', None)
+
+    def test_code_prepare_continues_with_worktree_after_clone(self):
+        with patch.object(mcp_server.code, 'repo_map', return_value={}), \
+                patch.object(mcp_server.repo_sync, 'load_sync_config', return_value={'dir': '/code'}), \
+                patch.object(mcp_server.repo_sync, 'clone_on_demand', return_value='已开始后台 clone') as clone, \
+                patch.object(mcp_server, 'handle_code_tool') as handle:
+            with self.assertRaises(core.ElkError):
+                mcp_server._clone_missing_repo({}, {'repo': 'group/sample', 'branch': 'feature/x'}, 'code_prepare')
+            then = clone.call_args[0][2]
+            then('group_sample')
+        handle.assert_called_once_with('code_prepare', {'repo': 'group_sample', 'branch': 'feature/x'})
 
 
 if __name__ == '__main__':

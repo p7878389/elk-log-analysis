@@ -186,7 +186,7 @@ TOOLS.append(
                             "days": {"type": "integer", "description": "日志分析天数，默认 7"}})})
 
 
-def _clone_missing_repo(ccfg, a):
+def _clone_missing_repo(ccfg, a, tool=None):
     """指定的 repo 不在代码目录时，按 GitLab 同步配置在后台 clone 并报错提示稍后重试；未配置同步时保持原有“没有仓库”报错。"""
     repo = a.get("repo")
     if not repo or os.path.isabs(os.path.expanduser(repo)):
@@ -197,7 +197,9 @@ def _clone_missing_repo(ccfg, a):
     scfg = repo_sync.load_sync_config()
     if scfg is None:
         return a
-    raise core.ElkError(repo_sync.clone_on_demand(scfg, repo))  # 后台 clone，本次告知稍后重试
+    # code_prepare：clone 完成后在后台接着准备 worktree 与索引，下次调用时更可能直接可用
+    then = (lambda d: handle_code_tool("code_prepare", dict(a, repo=d))) if tool == "code_prepare" else None
+    raise core.ElkError(repo_sync.clone_on_demand(scfg, repo, then))  # 后台 clone，本次告知稍后重试
 
 
 def handle_code_tool(name, a):
@@ -216,7 +218,7 @@ def handle_code_tool(name, a):
     if ccfg["roots"]:
         code.maybe_gc_background(ccfg)  # 闲置 worktree/索引清理：每天最多一次，后台执行
         if name in ("code_locate", "code_prepare"):
-            a = _clone_missing_repo(ccfg, a)
+            a = _clone_missing_repo(ccfg, a, name)
     if name == "code_services":
         env = core.get_env(core.load_config(), a["env"]) if a.get("env") else None
         return code.op_services(ccfg, a, env)

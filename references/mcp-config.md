@@ -159,6 +159,7 @@ ELK_PROD_MAX_SIZE=2000
 | `ELK_CODE_SERVICE_MAP` | 所有环境共用的 deployment → `仓库[/模块]`(JSON)；某个环境特有的映射写在 `ELK_<ENV>_SERVICE_MAP` | `{"saas-getway":"ruoyi-cloud-plus/saas-gateway"}` |
 | `ELK_CODE_CACHE` | worktree、索引日志、锁的缓存目录 | 默认 `~/.cache/elk-log-analysis` |
 | `ELK_CODE_FETCH_TTL` | 同一仓库 fetch 节流秒数 | 默认 `600` |
+| `ELK_CODE_REFRESH_INTERVAL` | HTTP 服务定时把已有分支 worktree 推进到远程分支最新并增量更新 GitNexus 索引的间隔；仓库同步结束后也会刷新一次。按 commit 的副本、使用中和索引构建中的跳过；`0` 关闭 | 默认 `1800` |
 | `ELK_CODE_LEASE` | 副本被 `code_prepare` 使用后，多少秒内即使分支有新提交也不推进（保护进行中的分析）；`refresh=true` 可强制推进 | 默认 `1800` |
 | `ELK_CODE_GC_DAYS` | 分支 worktree（`<仓库>@<分支>`）闲置多少天后自动删除（连同 GitNexus 索引）；`0` 关闭 | 默认 `10` |
 | `ELK_CODE_GC_EXACT_DAYS` | 按 commit 的 worktree（`<仓库>@<commit>`，exact 模式产生）闲置多少天后自动删除；`0` 关闭 | 默认 `3` |

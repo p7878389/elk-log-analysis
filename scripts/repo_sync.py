@@ -290,11 +290,12 @@ _ON_DEMAND = {}
 _ON_DEMAND_LOCK = threading.Lock()
 
 
-def clone_on_demand(scfg, name):
+def clone_on_demand(scfg, name, then=None):
     """code_* 指定的仓库不在代码目录时在后台 clone，不等下一次定时同步，也不阻塞本次调用。
     与定时同步共用凭据、拉取协议、排除规则、目录命名与清单，因此只会 clone 同步范围内的项目。
     name 可以是项目 path（check-poct）或完整路径（group/sub/check-poct），在同步范围内唯一匹配才 clone。
-    查找项目在前台完成（不存在、重名、上次失败时抛 ElkError）；clone 交给后台线程，返回“稍后重试”的说明。"""
+    查找项目在前台完成（不存在、重名、上次失败时抛 ElkError）；clone 交给后台线程，返回“稍后重试”的说明。
+    then(目录名)：clone 成功后在同一后台线程里接着执行（code_prepare 用它准备 worktree 并开始建索引）。"""
     bad = gitlab_auth.problem(scfg["auth"])
     if bad:
         raise core.ElkError(bad)
@@ -318,13 +319,13 @@ def clone_on_demand(scfg, name):
             del _ON_DEMAND[key]  # 失败只报告一次，下次调用重新 clone
             raise core.ElkError("仓库 %s 上次后台 clone 失败：%s；再次调用会重试" % (key, job["error"]))
         _ON_DEMAND[key] = {"started": time.time(), "running": True, "error": None}
-    threading.Thread(target=_clone_in_background, args=(scfg, hits[0]), name="clone-" + hits[0]["path"],
+    threading.Thread(target=_clone_in_background, args=(scfg, hits[0], then), name="clone-" + hits[0]["path"],
                      daemon=True).start()
     return ("仓库 %s 不在代码目录，已开始后台 clone（定时同步进行中时排在其后），"
             "稍后再调用；本次请改用本机仓库分析" % key)
 
 
-def _clone_in_background(scfg, p):
+def _clone_in_background(scfg, p, then=None):
     key, err = p["path_with_namespace"], None
     try:
         os.makedirs(scfg["dir"], exist_ok=True)
@@ -346,6 +347,11 @@ def _clone_in_background(scfg, p):
             _ON_DEMAND[key] = dict(_ON_DEMAND[key], running=False, error=err)
         else:
             _ON_DEMAND.pop(key, None)
+    if then and not err:
+        try:
+            then(p["dir"])
+        except Exception as exc:  # noqa: BLE001 — 只影响后续准备，下一次调用 code_prepare 会重新准备
+            _log(scfg, "✘ 按需 clone %s 后准备 worktree/索引失败：%s" % (key, str(exc)[:200]))
 
 
 def on_demand_jobs():
@@ -376,9 +382,6 @@ def _run_index(ccfg, wt, name, sha, timeout):
 
 def prebuild_indexes(scfg, repo_dirs, report):
     ccfg = scfg["code"]
-    if os.name == "nt":
-        report["index_skipped"] = "原生 Windows 不支持建索引"
-        return
     gn = code.gitnexus(ccfg)
     if gn.get("error"):
         report["index_skipped"] = gn["error"]
@@ -418,6 +421,80 @@ def prebuild_indexes(scfg, repo_dirs, report):
                     _log(scfg, "索引完成 %s" % name)
             except core.ElkError as e:
                 report["index_failed"].append({"repo": d, "env": env["_name"], "error": str(e)[:200]})
+
+
+_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_worktrees(ccfg, timeout=3600):
+    """把缓存里的分支 worktree 推进到远程分支最新提交，并逐个增量更新 GitNexus 索引，让有人在用的仓库保持最新。
+    只处理已有的分支 worktree（闲置清理会删掉长期不用的，所以范围就是近期用过的仓库/分支）；
+    按 commit 的 worktree、使用中（ELK_CODE_LEASE 内，ensure_worktree 不推进）、索引构建中的跳过。
+    不记为“使用”，不会让闲置的 worktree 逃过清理。返回 {"indexed", "fresh", "skipped", "failed"}。"""
+    report = {"indexed": [], "fresh": 0, "skipped": [], "failed": []}
+    gn = code.gitnexus(ccfg)
+    if gn.get("error"):
+        report["skipped"].append("全部：%s" % gn["error"])
+        return report
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        report["skipped"].append("全部：上一次刷新尚未结束")
+        return report
+    try:
+        base = code._cache_dir(ccfg, "worktrees")
+        for entry in sorted(os.listdir(base)):
+            wt = os.path.join(base, entry)
+            if ".stale-" in entry or not os.path.exists(os.path.join(wt, ".git")):
+                continue
+            src = code.worktree_source(ccfg, entry, wt)
+            if not src:
+                continue
+            repo_path, branch = src
+            try:
+                code.fetch(ccfg, repo_path)  # 节流：ELK_CODE_FETCH_TTL 内 fetch 过就跳过
+                head = code.commit_info(repo_path, "origin/" + branch)
+                info = {"repo": code.repo_name(ccfg, repo_path), "repo_path": repo_path}
+                ctx = {"branch": branch, "head": head, "commit": head}
+                if code.worktree_name(info, ctx) != entry:
+                    report["skipped"].append("%s：仓库名已变化" % entry)
+                    continue
+                wt, name, st, _, sha = code.ensure_worktree(ccfg, info, ctx, want_index=False, touch=False)
+                if st["state"] == "fresh":
+                    report["fresh"] += 1
+                    continue
+                if st["state"] == "building":
+                    report["skipped"].append("%s：索引构建中" % entry)
+                    continue
+                err = _run_index(ccfg, wt, name, sha, timeout)
+                if err:
+                    report["failed"].append({"repo": name, "error": err})
+                else:
+                    report["indexed"].append(name)
+            except core.ElkError as e:  # 远程分支已删除、仓库已移走等：只影响这一个 worktree
+                report["failed"].append({"repo": entry, "error": str(e)[:200]})
+    finally:
+        _REFRESH_LOCK.release()
+    return report
+
+
+def start_refresher(ccfg, log):
+    """后台线程：每 ELK_CODE_REFRESH_INTERVAL 秒刷新一次已有分支 worktree 与索引；仓库同步进行中时跳过（同步结束会刷新）。"""
+    if ccfg["refresh_interval"] <= 0:
+        return
+
+    def loop():
+        while True:
+            time.sleep(ccfg["refresh_interval"])
+            if _RUN_LOCK.locked():
+                continue
+            try:
+                r = refresh_worktrees(ccfg)
+                if r["indexed"] or r["failed"]:
+                    log("worktree 刷新：更新索引 %d（%s），已是最新 %d，失败 %d" % (
+                        len(r["indexed"]), ",".join(r["indexed"]), r["fresh"], len(r["failed"])))
+            except Exception as e:  # noqa: BLE001 — 定时线程不能因任何异常退出
+                log("worktree 刷新失败：%s" % e)
+
+    threading.Thread(target=loop, name="worktree-refresh", daemon=True).start()
 
 
 # ---------------------------------------------------------------- 一次完整同步
@@ -496,6 +573,12 @@ def _run_sync(scfg, index, say):
         say(_log(scfg, "索引：新建/更新 %d，已是最新 %d，失败 %d%s" % (
             len(report["indexed"]), report["index_fresh"], len(report["index_failed"]),
             "（跳过：%s）" % report["index_skipped"] if report["index_skipped"] else "")))
+    if index:
+        r = refresh_worktrees(scfg["code"], scfg["index_timeout"])
+        report["refreshed"] = r["indexed"]
+        report["index_failed"] += [dict(f, env="刷新") for f in r["failed"]]
+        say(_log(scfg, "已有分支 worktree 刷新：更新索引 %d，已是最新 %d，失败 %d" % (
+            len(r["indexed"]), r["fresh"], len(r["failed"]))))
     report.update(running=False, finished=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                   seconds=int(time.time() - start))
     _write_status(scfg, report)
@@ -600,6 +683,8 @@ def describe(scfg, grep=None):
             if st.get("indexed") or st.get("index_failed") or st.get("index_fresh"):
                 lines.append("索引: 新建/更新 %d，已是最新 %d，失败 %d" % (
                     len(st.get("indexed", [])), st.get("index_fresh", 0), len(st.get("index_failed", []))))
+            if st.get("refreshed"):
+                lines.append("已有分支 worktree 推进并更新索引: %s" % ", ".join(st["refreshed"][:20]))
         for d in st.get("detect", []):
             lines.append("  · " + d)
         for f in st.get("failed", [])[:10]:

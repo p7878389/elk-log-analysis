@@ -395,6 +395,10 @@ def main():
             log("GitLab 仓库同步已启用：%s（%s）→ %s，%s%s" % (
                 scfg["url"], mcp.repo_sync.gitlab_auth.describe(scfg["auth"]), scfg["dir"], "每 %d 秒" % scfg["interval"] if scfg["interval"] else "仅手动触发",
                 "，同步后预建 %s 分支索引" % ",".join(scfg["index_envs"]) if scfg["index_envs"] else ""))
+    ccfg = mcp.code.load_code_config()
+    if ccfg["roots"] and ccfg["refresh_interval"] > 0:
+        mcp.repo_sync.start_refresher(ccfg, log)
+        log("已有分支 worktree 每 %d 秒推进到远程最新并增量更新索引" % ccfg["refresh_interval"])
     if GITNEXUS:
         start_gitnexus()
     try:
