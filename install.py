@@ -4,7 +4,11 @@
 clone 仓库后运行，不带参数时逐项询问：
   macOS / Linux:  ./install.sh
   Windows:        powershell -ExecutionPolicy Bypass -File install.ps1
-也可直接 python3 install.py [选项]；重复运行即更新，--uninstall 卸载。
+也可直接 python3 install.py [选项]。
+
+默认生成 CC Switch 的 MCP / Skill 仓库导入页面，由 CC Switch 持久化并分发到客户端。
+不会直接改写客户端配置或 Skills 目录。更新、启用和卸载均在 CC Switch 中操作。
+仅显式使用 --manager direct 时执行下面的旧版直接安装流程：
 
 做三件事：
 1. 安装 skill（SKILL.md、LICENSE、references/、scripts/）到各客户端的 skills 目录：
@@ -19,7 +23,9 @@ clone 仓库后运行，不带参数时逐项询问：
    （Unix 600/700；Windows 去掉继承的 ACL，只授权当前用户与 SYSTEM）
 """
 import argparse
+import base64
 import getpass
+import html
 import json
 import os
 import re
@@ -64,6 +70,50 @@ CLIENTS = {
 STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 DRY = False
 ASSUME_YES = False
+
+
+def ccswitch_links(entries, clients, repo="p7878389/elk-log-analysis", branch="main"):
+    """Use CC Switch's public import protocol; never modify its database."""
+    config = json.dumps({"mcpServers": dict(entries)}, ensure_ascii=False).encode("utf-8")
+    mcp = "ccswitch://v1/import?" + urllib.parse.urlencode({
+        "resource": "mcp", "apps": ",".join(clients),
+        "config": base64.b64encode(config).decode("ascii")})
+    skill = "ccswitch://v1/import?" + urllib.parse.urlencode({
+        "resource": "skill", "repo": repo, "branch": branch})
+    return mcp, skill
+
+
+def prepare_ccswitch(args, clients):
+    """Prepare an import page. CC Switch owns persistence and client syncing."""
+    if args.link:
+        sys.exit("cc-switch 模式请在 Skills 页面管理源目录；--link 仅用于 --manager direct")
+    scripts = os.path.join(HOME, ".cc-switch", "skills", SKILL, "scripts")
+    entries = [(args.name, mcp_entry(args, scripts))]
+    if args.mode == "remote" and not args.no_gitnexus and probe_gitnexus(args.url, args.token):
+        entries.append((args.gitnexus_name, dict(entries[0][1], url=gitnexus_url(args.url))))
+    mcp, skill = ccswitch_links(entries, clients, args.skill_repo, args.skill_branch)
+    dest = os.path.abspath(os.path.expanduser(args.ccswitch_output or os.path.join(CONFIG_DIR, "cc-switch-import.html")))
+    if not DRY:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        content = ("<!doctype html><meta charset='utf-8'><title>ELK · CC Switch 导入</title>"
+                   "<h1>通过 CC Switch 管理 ELK</h1>"
+                   "<p>配置包含成员凭据，请勿分享本文件。客户端配置由 CC Switch 同步。</p>"
+                   "<ol><li><a href='%s'>导入 MCP 配置</a>：在 CC Switch 确认并启用目标应用。"
+                   "同名 MCP 已存在时只合并应用开关，修改地址或 token 请在 CC Switch 编辑。</li>"
+                   "<li><a href='%s'>添加 Skill 仓库</a>：随后在 Skills 页安装 elk-log-analysis，"
+                   "并为目标应用启用。</li></ol>"
+                   "<p>本地模式请先安装 Skill，再启用 stdio MCP；Skill 预期目录：%s。"
+                   "若 CC Switch 设置了自定义数据目录，请在 MCP 条目中调整脚本路径；"
+                   "ELK 环境配置在同一条目的 elk 对象中管理。</p>"
+                   "<p>更新、禁用和卸载均在 CC Switch 的 MCP / Skills 页面操作。</p>" %
+                   (html.escape(mcp, quote=True), html.escape(skill, quote=True), html.escape(os.path.dirname(scripts))))
+        atomic_write(dest, content)
+    say("\nCC Switch 导入页面：%s%s" % (dest, "（dry-run，未写入）" if DRY else ""))
+    say("请打开页面，依次在 CC Switch 导入 MCP 和安装 Skill，并勾选目标应用。")
+    say("没有改写 ~/.claude.json、~/.codex/config.toml 或客户端 Skills 目录。")
+    if args.mode == "remote" and args.token_store == "env":
+        say("请在客户端进程环境中配置 ELK_MCP_TOKEN，或在 CC Switch 中保存个人 token。")
+    return dest
 
 
 def say(msg=""):
@@ -628,6 +678,11 @@ def main():
     global DRY, ASSUME_YES
     p = argparse.ArgumentParser(description="安装 elk-log-analysis skill 与 MCP（macOS / Linux / Windows）")
     p.add_argument("--mode", choices=["local", "remote"], help="local：本机运行；remote：连接团队服务")
+    p.add_argument("--manager", choices=["cc-switch", "direct"], default="cc-switch",
+                   help="默认 cc-switch：生成公开导入协议页面，由 CC Switch 管理和同步；direct：旧版直接安装")
+    p.add_argument("--ccswitch-output", help="CC Switch 导入页面路径（包含凭据，仅本人可读）")
+    p.add_argument("--skill-repo", default="p7878389/elk-log-analysis", help="CC Switch Skill 来源仓库 owner/name")
+    p.add_argument("--skill-branch", default="main", help="Skill 来源分支，独立于 MCP 代码查询的 branch")
     p.add_argument("--url", help="远程服务地址，如 https://elk-mcp.example.com/mcp")
     p.add_argument("--token", help="个人 token（会留在 shell 历史中，建议交互输入或用 --token-stdin）")
     p.add_argument("--token-stdin", action="store_true", help="从标准输入读取 token")
@@ -657,6 +712,9 @@ def main():
                                               sys.version.split()[0]))
     say("仓库：%s\n客户端：%s%s" % (SRC, ", ".join(CLIENTS[c]["label"] for c in clients), "\n[dry-run] 不会写入任何文件" if DRY else ""))
     if args.uninstall:
+        if args.manager == "cc-switch":
+            say("请在 CC Switch 的 MCP / Skills 页卸载对应条目；客户端文件由 CC Switch 同步清理。")
+            return
         return uninstall(args, clients)
     resolve_args(args)
     if args.mode == "remote" and not args.skip_check:
@@ -666,6 +724,9 @@ def main():
             sys.exit("token 验证失败，未做任何改动。")
         if status == "unreachable" and not confirm("  服务暂时连不上（未连 VPN / 服务未启动？），仍然继续安装？", True):
             sys.exit("已取消，未做任何改动。")
+
+    if args.manager == "cc-switch":
+        return prepare_ccswitch(args, clients)
 
     step("安装 skill")
     dests = {c: install_skill(c, args.link) for c in clients}

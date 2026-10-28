@@ -139,7 +139,7 @@ python3 scripts/mcp_http.py gen-token alice
 
 ## 3. 成员客户端配置
 
-**推荐直接用安装脚本**：clone 仓库后运行 `./install.sh --mode remote --url https://elk-mcp.example.com/mcp`（Windows 上用 `install.ps1`），会自动安装 skill、写入 Claude Code 和 Codex 的配置，并设置好文件权限，详见[根目录 README](../README.md#安装)。下面是手动配置的方法，供其他客户端或不方便运行脚本时参考。
+**推荐用 CC Switch 统一管理**：clone 仓库后运行 `./install.sh --mode remote --url https://elk-mcp.example.com/mcp`（Windows 上用 `install.ps1`），默认生成导入页面；通过页面把 MCP 和 Skill 来源导入 CC Switch，再在 Skills 页安装并启用目标应用，由 CC Switch 分发配置。详见[根目录 README](../README.md#安装)。下面的直接配置仅供未使用 CC Switch 的客户端参考。
 
 不想让成员 clone 仓库时，可以用 `team-skill/build.py` 生成一个已填好服务地址的团队版 skill 压缩包分发给成员，解压即用，见 [team-skill/README.md](../team-skill/README.md)。
 
