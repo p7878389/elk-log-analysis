@@ -122,8 +122,8 @@ CODE_TARGET_PROPS = {
                            "description": "prod 下为 true 时才会查询生产日志推断部署时间；否则直接用分支最新提交"},
     "host": {"type": "string", "description": "日志中的 host.name（k8s pod 名），用于识别服务/模块并对齐部署版本"},
     "service": {"type": "string", "description": "应用名（spring.application.name）或模块名，host 未知时使用"},
-    "repo": {"type": "string", "description": "直接指定代码根目录下的仓库名；不在代码目录时，配置了 GitLab 同步的服务端会按需 clone "
-                                              "同步范围内唯一匹配的项目（可传项目名或 group/项目 完整路径）"},
+    "repo": {"type": "string", "description": "直接指定代码根目录下的仓库名；不在代码目录时，配置了 GitLab 同步的服务端会在后台 clone "
+                                              "同步范围内唯一匹配的项目并提示稍后重试（可传项目名或 group/项目 完整路径）"},
     "module": {"type": "string", "description": "配合 repo 指定模块相对路径"},
     "git_url": {"type": "string", "description": "索引不存在时手动 clone 的 GitLab http(s) 地址；仅管理员可用，token 不会写入仓库配置"},
     "access_token": {"type": "string", "description": "GitLab access token；仅用于本次 clone，通过内存环境传递，不会写入日志或 remote URL"},
@@ -187,7 +187,7 @@ TOOLS.append(
 
 
 def _clone_missing_repo(ccfg, a):
-    """指定的 repo 不在代码目录时，按 GitLab 同步配置按需 clone；未配置同步时保持原有“没有仓库”报错。"""
+    """指定的 repo 不在代码目录时，按 GitLab 同步配置在后台 clone 并报错提示稍后重试；未配置同步时保持原有“没有仓库”报错。"""
     repo = a.get("repo")
     if not repo or os.path.isabs(os.path.expanduser(repo)):
         return a
@@ -197,7 +197,7 @@ def _clone_missing_repo(ccfg, a):
     scfg = repo_sync.load_sync_config()
     if scfg is None:
         return a
-    return dict(a, repo=repo_sync.clone_on_demand(scfg, repo))
+    raise core.ElkError(repo_sync.clone_on_demand(scfg, repo))  # 后台 clone，本次告知稍后重试
 
 
 def handle_code_tool(name, a):

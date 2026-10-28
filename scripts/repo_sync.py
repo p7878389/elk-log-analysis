@@ -285,17 +285,21 @@ def _sync_one(scfg, p, manifest):
         return action, None
 
 
+# 进程内的按需 clone 任务：path_with_namespace → {"started", "running", "error"}；跨进程重复由 repo-sync 锁兜底
+_ON_DEMAND = {}
+_ON_DEMAND_LOCK = threading.Lock()
+
+
 def clone_on_demand(scfg, name):
-    """code_* 指定的仓库不在代码目录时立即 clone，不等下一次定时同步；返回仓库目录名。
+    """code_* 指定的仓库不在代码目录时在后台 clone，不等下一次定时同步，也不阻塞本次调用。
     与定时同步共用凭据、拉取协议、排除规则、目录命名与清单，因此只会 clone 同步范围内的项目。
-    name 可以是项目 path（check-poct）或完整路径（group/sub/check-poct），在同步范围内唯一匹配才 clone。"""
+    name 可以是项目 path（check-poct）或完整路径（group/sub/check-poct），在同步范围内唯一匹配才 clone。
+    查找项目在前台完成（不存在、重名、上次失败时抛 ElkError）；clone 交给后台线程，返回“稍后重试”的说明。"""
     bad = gitlab_auth.problem(scfg["auth"])
     if bad:
         raise core.ElkError(bad)
     if not scfg["dir"]:
         raise core.ElkError("未配置同步目录：请设置 ELK_CODE_ROOT 或 ELK_REPO_SYNC_DIR")
-    if _RUN_LOCK.locked():
-        raise core.ElkError("仓库 %s 不在代码目录，且定时同步正在进行中，同步完成后再试" % name)
     check_login(scfg)
     want = name.strip("/").lower()
     hits = [p for p in list_projects(scfg, search=want.rsplit("/", 1)[-1])
@@ -305,17 +309,49 @@ def clone_on_demand(scfg, name):
     if len(hits) > 1:
         raise core.ElkError("GitLab 上有多个项目叫 %s，请传完整路径：%s"
                             % (name, ", ".join(p["path_with_namespace"] for p in hits)))
-    os.makedirs(scfg["dir"], exist_ok=True)
-    with code._Lock(scfg["code"], "repo-sync"):  # 与定时同步（含其他进程）互斥，清单读写不交错
-        manifest = _load_manifest(scfg)
-        p = plan_dirs(scfg, choose_transport(scfg, hits), manifest)[0]
-        action, err = _sync_one(scfg, p, manifest)
+    key = hits[0]["path_with_namespace"]
+    with _ON_DEMAND_LOCK:
+        job = _ON_DEMAND.get(key)
+        if job and job["running"]:
+            return "仓库 %s 正在后台 clone（已 %d 秒），稍后再调用；本次请改用本机仓库分析" % (key, time.time() - job["started"])
+        if job and job["error"]:
+            del _ON_DEMAND[key]  # 失败只报告一次，下次调用重新 clone
+            raise core.ElkError("仓库 %s 上次后台 clone 失败：%s；再次调用会重试" % (key, job["error"]))
+        _ON_DEMAND[key] = {"started": time.time(), "running": True, "error": None}
+    threading.Thread(target=_clone_in_background, args=(scfg, hits[0]), name="clone-" + hits[0]["path"],
+                     daemon=True).start()
+    return ("仓库 %s 不在代码目录，已开始后台 clone（定时同步进行中时排在其后），"
+            "稍后再调用；本次请改用本机仓库分析" % key)
+
+
+def _clone_in_background(scfg, p):
+    key, err = p["path_with_namespace"], None
+    try:
+        os.makedirs(scfg["dir"], exist_ok=True)
+        with code._Lock(scfg["code"], "repo-sync"):  # 与定时同步（含其他进程）互斥，清单读写不交错
+            manifest = _load_manifest(scfg)
+            p = plan_dirs(scfg, choose_transport(scfg, [p]), manifest)[0]
+            action, err = _sync_one(scfg, p, manifest)
+            if not err:
+                _save_manifest(scfg, manifest)
+        if not err:
+            code._MEMO.clear()  # 新仓库立即可被 code_* 发现
+            _log(scfg, "+ 按需%s %s → %s" % ("clone" if action == "cloned" else "接管", key, p["dir"]))
+    except Exception as exc:  # noqa: BLE001 — 后台线程不能把异常抛丢，结果留给下一次调用
+        err = str(exc)[:300]
+    if err:
+        _log(scfg, "✘ 按需 clone %s：%s" % (key, err))
+    with _ON_DEMAND_LOCK:
         if err:
-            raise core.ElkError("按需 clone %s 失败：%s" % (p["path_with_namespace"], err))
-        _save_manifest(scfg, manifest)
-    code._MEMO.clear()  # 新仓库立即可被 code_* 发现
-    _log(scfg, "+ 按需%s %s → %s" % ("clone" if action == "cloned" else "接管", p["path_with_namespace"], p["dir"]))
-    return p["dir"]
+            _ON_DEMAND[key] = dict(_ON_DEMAND[key], running=False, error=err)
+        else:
+            _ON_DEMAND.pop(key, None)
+
+
+def on_demand_jobs():
+    """code_repos 展示用：进行中或失败未报告的按需 clone。"""
+    with _ON_DEMAND_LOCK:
+        return {k: dict(v) for k, v in _ON_DEMAND.items()}
 
 
 # ---------------------------------------------------------------- GitNexus 预建索引
@@ -572,6 +608,9 @@ def describe(scfg, grep=None):
             lines.append("  ✘ 索引 %s（%s）：%s" % (f["repo"], f["env"], f["error"][:160]))
         if st.get("stale"):
             lines.append("已无权限或已删除（本地保留，未删除）: %s" % ", ".join(st["stale"][:20]))
+    for key, job in sorted(on_demand_jobs().items()):
+        lines.append("  %s 按需 clone %s%s" % ("…" if job["running"] else "✘", key, "：进行中（已 %d 秒）" % (
+            time.time() - job["started"]) if job["running"] else "：%s" % job["error"][:160]))
     m = _load_manifest(scfg)["projects"]
     items = sorted((v["dir"], v["path"]) for v in m.values())
     if grep:
