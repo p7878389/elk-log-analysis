@@ -133,6 +133,35 @@ class MissingRepoHook(unittest.TestCase):
             a = {'repo': 'sample'}
             self.assertIs(mcp_server._clone_missing_repo({}, a), a)
 
+    def test_full_path_of_existing_repo_skips_clone(self):
+        origins = {'/code/sample': 'ssh://git@gitlab.invalid:222/Group/Sub/sample.git'}
+        with patch.object(mcp_server.code, 'repo_map', return_value={'sample': '/code/sample'}), \
+                patch.object(mcp_server.repo_sync, '_origin', side_effect=origins.get), \
+                patch.object(mcp_server.repo_sync, 'load_sync_config', side_effect=AssertionError('no lookup')):
+            a = {'repo': 'group/sub/sample', 'branch': 'feature/x'}
+            self.assertEqual(mcp_server._clone_missing_repo({}, a), {'repo': 'sample', 'branch': 'feature/x'})
+
+    def test_full_path_finds_repo_stored_under_namespaced_dir(self):
+        repos = {'sample': '/code/sample', 'group-b_sample': '/code/group-b_sample'}
+        origins = {'/code/sample': 'git@gitlab.invalid:group-a/sample.git',
+                   '/code/group-b_sample': 'https://gitlab.invalid/group-b/sample.git'}
+        with patch.object(mcp_server.repo_sync, '_origin', side_effect=origins.get):
+            self.assertEqual(repo_sync.find_local_repo(repos, 'group-a/sample'), 'sample')
+            self.assertEqual(repo_sync.find_local_repo(repos, 'group-b/sample'), 'group-b_sample')
+
+    def test_full_path_of_other_project_with_same_name_is_still_cloned(self):
+        with patch.object(mcp_server.code, 'repo_map', return_value={'sample': '/code/sample'}), \
+                patch.object(mcp_server.repo_sync, '_origin', return_value='https://gitlab.invalid/group-a/sample.git'), \
+                patch.object(mcp_server.repo_sync, 'load_sync_config', return_value={'dir': '/code'}), \
+                patch.object(mcp_server.repo_sync, 'clone_on_demand', return_value='已开始后台 clone') as clone:
+            with self.assertRaises(core.ElkError):
+                mcp_server._clone_missing_repo({}, {'repo': 'group-b/sample'})
+        clone.assert_called_once_with({'dir': '/code'}, 'group-b/sample', None)
+
+    def test_project_name_without_group_does_not_read_origins(self):
+        with patch.object(mcp_server.repo_sync, '_origin', side_effect=AssertionError('no git')):
+            self.assertIsNone(repo_sync.find_local_repo({'sample': '/code/sample'}, 'other'))
+
     def test_missing_repo_without_sync_config_keeps_original_error_path(self):
         with patch.object(mcp_server.code, 'repo_map', return_value={}), \
                 patch.object(mcp_server.repo_sync, 'load_sync_config', return_value=None):

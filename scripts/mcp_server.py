@@ -200,6 +200,9 @@ def _clone_missing_repo(ccfg, a, tool=None):
     repos = code.repo_map(ccfg)
     if repo in repos or any(os.path.basename(p) == repo for p in repos.values()):
         return a
+    local = repo_sync.find_local_repo(repos, repo)
+    if local:
+        return dict(a, repo=local)
     scfg = repo_sync.load_sync_config()
     if scfg is None:
         return a

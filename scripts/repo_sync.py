@@ -208,6 +208,22 @@ def _origin(path):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def find_local_repo(repos, name):
+    """完整路径（group/sub/project）→ 代码目录里 origin 指向该项目的仓库名；没有时返回 None。
+    只读同名目录（project 或 plan_dirs 生成的 group_sub_project）的 origin，不逐个查全部仓库。"""
+    want = name.strip("/").lower()
+    if "/" not in want:
+        return None
+    last = want.rsplit("/", 1)[-1]
+    for repo, path in repos.items():
+        base = os.path.basename(path).lower()
+        if base != last and not base.endswith("_" + last):
+            continue
+        if _norm_url(_origin(path)).partition("/")[2] == want:
+            return repo
+    return None
+
+
 def plan_dirs(scfg, projects, manifest):
     """项目 → 本地目录名。已登记的沿用；同名项目（不同组下 path 相同）改用 组_子组_项目 以免冲突。"""
     known = {int(k): v["dir"] for k, v in manifest["projects"].items()}
