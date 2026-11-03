@@ -709,7 +709,7 @@ JSONISH = ("INDICES", "FIELDS", "SERVICE_MAP", "INDEX_FIELDS")
 def export_array(cfg, inline_globals=True):
     """当前生效配置 → envs.json 的 environments 数组。只导出显式配置过的项（级别预设能推出来的不重复写）；
     inline_globals=True 时把全局 ELK_<KEY> 也写进每个环境，使每项自成一体。
-    凭据：keychain:/env: 引用原样导出；明文密码/API Key 改为 env:ELK_<ENV>_<KEY> 引用（envs.json 禁止明文），
+    凭据：keychain:/env: 引用原样导出；明文密码/API Key 改为 env:ELK_<ENV>_<KEY> 引用（导出结果会显示在终端，不输出明文），
     明文用户名用占位符代替；明文值绝不输出。"""
     layers = cfg.get("_layers") or {}
     globals_ = layers.get("globals", {}) if inline_globals else {}

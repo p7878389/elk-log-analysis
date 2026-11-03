@@ -56,7 +56,7 @@
 
 ## envs.json 写法（兜底）
 
-格式与 elk 对象相同（`default_env` / `defaults` / `fields` / `environments`），文件权限设为 600。区别是 `password` / `api_key` **不能写明文**，只能写 `env:<变量名>`（真实密码作为字符串变量放在 elk MCP env 中）或 `keychain:<service>/<account>`。只有 MCP env 和 cc-switch 中都没有配置时才会读取。
+格式与 elk 对象相同（`default_env` / `defaults` / `fields` / `environments`），文件权限设为 600（权限过宽时会警告）。`password` / `api_key` 可以写明文，也可以写 `env:<变量名>`（真实密码作为字符串变量放在 elk MCP env 中）或 `keychain:<service>/<account>`。只有 MCP env 和 cc-switch 中都没有配置时才会读取。
 
 ## 分层规则
 
@@ -201,9 +201,9 @@ git -C ~/code/<仓库> worktree remove --force ~/.cache/elk-log-analysis/worktre
 
 | 写法 | 含义 | 存储位置 |
 |---|---|---|
-| `明文` | 直接填（MCP env 或 cc-switch elk 对象；envs.json 中禁止） | 明文存于 cc-switch.db、~/.claude.json；写在 MCP env 时还会进入 ~/.codex/config.toml |
+| `明文` | 直接填（MCP env、cc-switch elk 对象或 envs.json） | 明文存于 cc-switch.db、~/.claude.json 或 envs.json（需 chmod 600）；写在 MCP env 时还会进入 ~/.codex/config.toml |
 | `keychain:<service>/<account>` | 从 macOS 钥匙串读取（推荐生产使用） | 钥匙串 |
-| `env:<变量名>` | 从 MCP 进程的环境变量读取（envs.json 推荐写法，变量放在 elk MCP env 中） | cc-switch 的 elk MCP env |
+| `env:<变量名>` | 从 MCP 进程的环境变量读取（变量放在 elk MCP env 或部署的 .env 中） | cc-switch 的 elk MCP env / .env |
 
 钥匙串写入（用户自己在终端执行，回车后输入密码）：
 ```bash

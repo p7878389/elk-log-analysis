@@ -1,5 +1,5 @@
 {
-  "_comment": "复制为 envs.json。服务端配置：password/api_key 只能写 env:<变量名>（值放 deploy/.env）；keychain: 仅 macOS 本机可用，服务器上不要用。",
+  "_comment": "复制为 envs.json。password/api_key 可以直接写明文（文件属主 10001、权限 600，docker-up.sh 以 root 运行时会自动设置），也可以写 env:<变量名>（值放 .env）；keychain: 仅 macOS 本机可用，服务器上不要用。",
   "default_env": "test",
   "environments": [
     {

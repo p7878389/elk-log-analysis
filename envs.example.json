@@ -1,5 +1,5 @@
 {
-  "_comment": "复制到 ~/.config/elk-log-analysis/envs.json 并 chmod 600。只在 MCP env 未设置 ELK_ENVIRONMENTS / ELK_ENVS 时使用。environments 为数组，每项一个环境，字段与 ELK_ENVIRONMENTS 相同；defaults 为全局默认；未配置的项由环境级别预设补齐。本文件中 password/api_key 只能写 keychain:<service>/<account> 或 env:<变量名>，禁止明文。",
+  "_comment": "复制到 ~/.config/elk-log-analysis/envs.json 并 chmod 600。只在 MCP env 未设置 ELK_ENVIRONMENTS / ELK_ENVS 时使用。environments 为数组，每项一个环境，字段与 ELK_ENVIRONMENTS 相同；defaults 为全局默认；未配置的项由环境级别预设补齐。本文件中 password/api_key 可以写明文（文件务必 chmod 600），也可以写 keychain:<service>/<account> 或 env:<变量名>。",
   "default_env": "test",
   "fields": {
     "timestamp": "@timestamp",

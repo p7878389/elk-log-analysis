@@ -458,22 +458,14 @@ def load_config():
         raise ElkError("未找到环境配置：请在 cc-switch 的 elk MCP 配置顶层添加 elk 对象"
                        "（{\"default_env\":\"test\",\"environments\":[{\"env\":\"test\",\"url\":\"...\"}]}），"
                        "或创建 %s（模板见 skill 目录 envs.example.json）。" % CONFIG_PATH)
+    # 凭据可以写明文，也可以写 env:<变量名> / keychain:<service>/<account> 引用；含明文时文件应只让本人可读
     mode = os.stat(CONFIG_PATH).st_mode & 0o777
     if mode & 0o077 and os.name != "nt":  # Windows 权限由 ACL 控制，st_mode 恒为 666，无参考意义
         print("[elk] 警告: %s 权限为 %o，建议 chmod 600" % (CONFIG_PATH, mode), file=sys.stderr)
     with open(CONFIG_PATH, encoding="utf-8") as f:
-        text = f.read()
-    if re.search(r'"type"\s*:\s*"inline"', text):
-        raise ElkError("%s 中不允许 inline 凭据，请改为 keychain/env 引用" % CONFIG_PATH)
-    cfg = json.loads(text)
+        cfg = json.load(f)
     if isinstance(cfg.get("environments"), list):
-        # 数组写法：与 ELK_ENVIRONMENTS 相同的简化键；defaults 为全局层；凭据只能用 keychain:/env: 引用
-        for item in cfg["environments"] + [cfg.get("defaults") or {}]:
-            for key in ("password", "api_key"):
-                v = item.get(key)
-                if isinstance(v, str) and v and not v.startswith(("keychain:", "env:")):
-                    raise ElkError("%s 中 %s 不能写明文，请改为 keychain:<service>/<account> 或 env:<变量名>"
-                                   % (CONFIG_PATH, key))
+        # 数组写法：与 ELK_ENVIRONMENTS 相同的简化键；defaults 为全局层
         return _config_from_object(cfg, CONFIG_PATH)
     # envs.json 同样分层：顶层 defaults 为全局，environments.<name> 覆盖之
     defaults = cfg.get("defaults") or {}
@@ -515,8 +507,8 @@ def describe_envs(cfg, verbose=False):
         aliases = ",".join(env.get("aliases", []))
         auth = env.get("auth", {})
         ref = auth.get("password") or auth.get("api_key") or {}
-        cred = {"inline": "已配置", "missing": "未配置", "keychain": "钥匙串",
-                "env": "环境变量"}.get(ref.get("type") if isinstance(ref, dict) else "", "-")
+        kind = ref.get("type") if isinstance(ref, dict) else ("inline" if isinstance(ref, str) and ref else "")
+        cred = {"inline": "已配置", "missing": "未配置", "keychain": "钥匙串", "env": "环境变量"}.get(kind, "-")
         lines.append("%-8s %-7s %-40s index=%s auth=%s(%s) tier=%s branch=%s aliases=%s %s" % (
             name, env.get("mode", "es"), target or "(未配置地址)", env.get("index", "*"),
             auth.get("type", "none"), cred, env.get("tier") or "-", env.get("branch") or "-",
@@ -543,9 +535,8 @@ def resolve_secret(ref, env_name, label, interactive=True):
     """把配置里的凭据引用解析成真实值。值只在内存中使用，从不输出。"""
     if not ref:
         return None
-    if isinstance(ref, str):
-        raise ElkError("环境 %s 的 %s 是明文字符串，已拒绝。请改为 keychain/env/prompt 引用。"
-                       % (env_name, label))
+    if isinstance(ref, str):  # envs.json 旧版字典写法中直接写的明文
+        return ref
     kind = ref.get("type")
     if kind == "inline":
         return ref["value"]

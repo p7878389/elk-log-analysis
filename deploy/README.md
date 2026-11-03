@@ -62,7 +62,7 @@ Windows（Docker Desktop）在部署目录用 PowerShell 运行 `docker-up.ps1`�
 | 镜像与端口 | `ELK_IMAGE`、`ELK_HTTP_PUBLISH`、`COMPOSE_PROFILES` | 一般由 `docker-up.sh` 的 `--image` / `--load` / `--publish` / `--tls` 写入 |
 | HTTP 服务 | `ELK_HTTP_DISABLED_TOOLS`、`ELK_HTTP_ALLOWED_ORIGINS`、`ELK_HTTP_CERT` / `ELK_HTTP_KEY` | 证书等文件放在 `config/`（容器内 `/config`） |
 
-也可以继续用文件：`config/envs.json`（环境，密码写 `env:变量名`）和 `config/tokens.json`（成员 token）。两种方式同时存在时，ELK 环境以环境变量为准，成员 token 合并生效。文件方式的好处是修改 `tokens.json` 不用重启。
+也可以继续用文件：`config/envs.json`（环境；密码可直接写明文，也可写 `env:变量名` 引用 `.env` 中的值）和 `config/tokens.json`（成员 token）。两种方式同时存在时，ELK 环境以环境变量为准（`.env` 中留着 `ELK_ENVS` / `ELK_ENVIRONMENTS` 时 `envs.json` 不生效，用文件时要注释掉模板里的这几行），成员 token 合并生效。文件方式的好处是修改 `tokens.json` 不用重启。
 
 **gitnexus**（`code_*` 源码定位与 `/gitnexus/mcp`）：默认服务器上没有 node / gitnexus，由 `docker-compose.yml` 中的一次性服务 `gitnexus-install` 安装，不需要单独配置：
 
@@ -125,7 +125,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\native-up.ps1 stop
 外部 MCP 客户端连接 `http://<Windows 局域网 IP>:8765/mcp`，携带
 `Authorization: Bearer <成员 token>`。需设置 `ELK_HTTP_HOST=0.0.0.0`，
 并确保网络和主机防火墙允许目标端口。HTTP 仅用于可信内网；公网部署使用 HTTPS。
-密码保存在被 Git 忽略的 `.env`，环境 JSON 使用 `env:变量名` 引用。
+密码可以保存在被 Git 忽略的 `.env`，由环境 JSON 用 `env:变量名` 引用，也可以直接写在 `envs.json`（同样被 Git 忽略，只让服务账户可读）。
 令牌明文和客户端配置应保存在被 Git 忽略、仅当前用户可读的 `deploy/data/`。
 
 ### 手动 clone GitLab 仓库
