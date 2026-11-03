@@ -1,8 +1,10 @@
 """Real HTTP transport tests without external ELK credentials or services."""
 from http.client import HTTPConnection
 import json
+import os
 import pathlib
 import sys
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -98,6 +100,54 @@ class HttpTransport(unittest.TestCase):
     def test_health_and_no_sse(self):
         self.assertEqual(self.request(None, method="GET", path="/healthz"), (200, b"ok"))
         self.assertEqual(self.request(None, method="GET")[0], 405)
+
+
+class TokenSources(unittest.TestCase):
+    """ELK_HTTP_TOKENS（环境变量）与 ELK_HTTP_TOKENS_FILE（文件）两种来源。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self.dir.name) / "tokens.json"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_token_items_formats(self):
+        items = http.token_items([
+            {"name": "admin", "sha256": http.sha256("a").upper(), "prod": True, "admin": True},
+            {"name": "plain", "token": "p"},
+            {"name": "off", "sha256": http.sha256("o"), "disabled": True},
+            {"sha256": http.sha256("x")},
+        ])
+        self.assertEqual([t["name"] for t in items], ["admin", "plain"])
+        self.assertEqual(items[0]["sha256"], http.sha256("a"))
+        self.assertTrue(items[0]["prod"] and items[0]["admin"] and items[0]["code"])
+        self.assertEqual(http.token_items({"tokens": [{"name": "b", "token": "b"}]})[0]["name"], "b")
+
+    def test_env_only_when_file_missing(self):
+        tokens = http.Tokens(str(self.path), http.token_items([{"name": "env", "token": "e"}]))
+        self.assertEqual(tokens.lookup("e")["name"], "env")
+        self.assertIsNone(tokens.lookup("other"))
+
+    def test_empty_env_tokens_without_file_rejects_all(self):
+        tokens = http.Tokens(str(self.path), [])
+        self.assertIsNone(tokens.lookup("e"))
+
+    def test_env_and_file_merged_and_file_reloaded(self):
+        self.path.write_text(json.dumps({"tokens": [{"name": "file", "token": "f"}]}), encoding="utf-8")
+        tokens = http.Tokens(str(self.path), http.token_items([{"name": "env", "token": "e"}]))
+        self.assertEqual(tokens.lookup("e")["name"], "env")
+        self.assertEqual(tokens.lookup("f")["name"], "file")
+        self.path.write_text(json.dumps({"tokens": [{"name": "file2", "token": "g"}]}), encoding="utf-8")
+        os.utime(self.path, (tokens.mtime + 5, tokens.mtime + 5))
+        self.assertIsNone(tokens.lookup("f"))
+        self.assertEqual(tokens.lookup("g")["name"], "file2")
+        self.assertEqual(tokens.lookup("e")["name"], "env")
+
+    def test_file_only_unchanged(self):
+        self.path.write_text(json.dumps({"tokens": [{"name": "file", "token": "f"}]}), encoding="utf-8")
+        tokens = http.Tokens(str(self.path))
+        self.assertEqual(tokens.lookup("f")["name"], "file")
 
 
 if __name__ == "__main__":

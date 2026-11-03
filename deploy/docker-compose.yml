@@ -1,10 +1,14 @@
-# 推荐用一键脚本：deploy/docker-up.sh（Windows：deploy\docker-up.ps1），首次运行会初始化配置并生成管理员 token
-# 手动用法（在 deploy 目录下）：
-#   cp .env.example .env && cp config/envs.example.json config/envs.json && cp config/tokens.example.json config/tokens.json
-#   docker compose up -d --build                 # 仅日志查询
-#   ELK_IMAGE_TARGET=code docker compose up -d --build   # 含源码分析 + GitLab 仓库定时同步 + 服务端 GitNexus
-#   docker compose --profile tls up -d --build   # 同时启动 Caddy 自动 HTTPS（需公网域名，见 Caddyfile）
-# ELK_IMAGE_TARGET / ELK_HTTP_PUBLISH / COMPOSE_PROFILES 也可以写在 .env 中，之后直接 docker compose up -d 即可
+# 服务器上的部署文件，只引用已构建好的镜像，不在这里构建，也不依赖源码；服务器上也不需要预装 node / gitnexus。
+# 镜像在开发机或 CI 中由源码仓库的 deploy/build-image.sh 构建，它同时生成部署包（本文件、模板与脚本）。
+# 推荐在部署目录（部署包解压处，如 /opt/elk-mcp）运行一键脚本：./docker-up.sh，首次会初始化 .env 并生成管理员 token
+# 配置全部来自 .env（env_file 传给容器）：ELK 环境、成员 token、GitLab 凭据、数据目录、gitnexus 版本等，见 .env.example
+# 手动用法（在部署目录下）：
+#   cp .env.example .env && chmod 600 .env，填写 ELK_IMAGE、ELK_* 环境与密码、ELK_HTTP_TOKENS
+#   docker compose up -d                       # 先运行 gitnexus-install，再启动 elk-mcp；镜像不在本机时从镜像仓库拉取
+#   docker compose --profile tls up -d         # 同时启动 Caddy 自动 HTTPS（需公网域名，见 Caddyfile）
+
+# 固定项目名：数据卷名为 elk-mcp_elk-data 等，不随部署目录名变化
+name: elk-mcp
 
 # 常驻运行时容器日志会一直增长：按大小轮转，最多保留 5 个 10MB 文件
 x-logging: &logging
@@ -14,26 +18,65 @@ x-logging: &logging
     max-file: "5"
 
 services:
+  # 一次性服务：用官方 node 镜像把 node + gitnexus 装进数据卷 gitnexus-tools，elk-mcp 只读挂载使用（code_* 与 /gitnexus/mcp）。
+  # node 镜像与 elk-mcp 镜像同为 Debian bookworm，安装时编译的原生模块在 elk-mcp 中可以直接运行。
+  # 幂等：版本与 node 都没变时秒退；先装到 staging 再整体替换 current，装到一半失败不会破坏已有版本。
+  # 改了版本后重新 up，装好后需重启 elk-mcp 才会加载新文件（docker-up.sh 会自动重启）。
+  # 需要能访问 Docker Hub 与 npm 源；内网可在 .env 中把 ELK_NODE_IMAGE / ELK_NPM_REGISTRY 指向内部镜像源。
+  gitnexus-install:
+    # 用完整版 node 镜像：带编译工具，tree-sitter 等原生模块在 linux/arm64 等平台没有预编译包时可现场编译
+    image: ${ELK_NODE_IMAGE:-node:22-bookworm}
+    restart: "no"
+    logging: *logging
+    environment:
+      GITNEXUS_VERSION: ${ELK_GITNEXUS_VERSION:-1.6.12}
+      NPM_CONFIG_REGISTRY: ${ELK_NPM_REGISTRY:-https://registry.npmjs.org}
+      NPM_CONFIG_UPDATE_NOTIFIER: "false"
+      NPM_CONFIG_FUND: "false"
+    volumes:
+      - gitnexus-tools:/tools
+    command:
+      - sh
+      - -ec
+      - |
+        want="$$GITNEXUS_VERSION $$(node --version)"
+        if [ -f /tools/current/.installed ] && [ "$$(cat /tools/current/.installed)" = "$$want" ]; then
+          echo "gitnexus 已安装：$$want"
+          exit 0
+        fi
+        echo "安装 gitnexus@$$GITNEXUS_VERSION（$$(node --version)，源 $$NPM_CONFIG_REGISTRY）"
+        rm -rf /tools/staging /tools/old
+        npm install -g --no-audit --prefix /tools/staging "gitnexus@$$GITNEXUS_VERSION"
+        cp "$$(command -v node)" /tools/staging/bin/node
+        echo "$$want" > /tools/staging/.installed
+        if [ -d /tools/current ]; then mv /tools/current /tools/old; fi
+        mv /tools/staging /tools/current
+        rm -rf /tools/old
+        echo "GITNEXUS_INSTALLED $$want"
+
   elk-mcp:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: ${ELK_IMAGE_TARGET:-base}
-    image: elk-mcp:${ELK_IMAGE_TARGET:-base}
+    image: ${ELK_IMAGE:-elk-mcp:latest}
     restart: unless-stopped
     logging: *logging
     env_file: .env
+    depends_on:
+      gitnexus-install:
+        condition: service_completed_successfully
     ports:
-      # 默认只监听本机，由反向代理对外；内网直连可改为 "8765:8765"
+      # 默认只监听本机，由反向代理对外；内网直连在 .env 中设 ELK_HTTP_PUBLISH=8765
       - "${ELK_HTTP_PUBLISH:-127.0.0.1:8765}:8765"
     # 容器不继承宿主机 /etc/hosts：若服务器靠 hosts 解析 Kibana 域名，在这里补上
     # extra_hosts:
     #   - "kibana-test.example.com:10.0.0.10"
     #   - "kibana.example.com:10.0.0.10"
     volumes:
-      - ./config:/config:ro          # envs.json / tokens.json，挂目录而非单文件，tokens 修改后自动生效
-      - elk-data:/data               # 调用日志、worktree、GitNexus 索引与登记表（GITNEXUS_HOME=/data/gitnexus）
-      - elk-repos:/repos             # GitLab 同步下来的仓库（部分 clone）；想放到指定磁盘可改为 /srv/repos:/repos
+      # 镜像约定 gitnexus 在 /opt/gitnexus/current（ELK_CODE_NODE / ELK_CODE_GITNEXUS 已在镜像中设置）
+      - gitnexus-tools:/opt/gitnexus:ro
+      # 可选：改用文件配置时放 envs.json / tokens.json，以及证书、SSH 私钥等；挂目录而非单文件，tokens 修改后自动生效
+      - ./config:/config:ro
+      # 数据目录：默认 Docker 数据卷；.env 中 ELK_DATA_DIR / ELK_REPOS_DIR 写绝对路径则改用宿主机目录
+      - ${ELK_DATA_DIR:-elk-data}:/data      # 调用日志、worktree、GitNexus 索引与登记表（GITNEXUS_HOME=/data/gitnexus）
+      - ${ELK_REPOS_DIR:-elk-repos}:/repos   # GitLab 同步下来的仓库（部分 clone）
       # 不用 GitLab 令牌、改用 SSH 拉取已有仓库时，挂载只读 deploy key：
       # - ~/.ssh/elk_deploy_key:/home/elk/.ssh/id_ed25519:ro
       # - ~/.ssh/known_hosts:/home/elk/.ssh/known_hosts:ro
@@ -55,4 +98,5 @@ services:
 volumes:
   elk-data:
   elk-repos:
+  gitnexus-tools:
   caddy-data:

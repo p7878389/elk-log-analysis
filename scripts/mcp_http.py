@@ -11,6 +11,8 @@
   ELK_HTTP_PORT            端口，默认 8765
   ELK_HTTP_PATH            MCP 端点路径，默认 /mcp
   ELK_HTTP_TOKENS_FILE     成员 token 文件（JSON，见 deploy/tokens.example.json），修改后自动重新加载
+  ELK_HTTP_TOKENS          成员 token（JSON，与文件内容相同，或直接写 tokens 数组），适合容器用环境变量配置；
+                           与 ELK_HTTP_TOKENS_FILE 可同时使用（合并），文件不存在时只用它；修改后需重启生效
   ELK_HTTP_NO_AUTH         =1 时不校验 token（仅限前面已有反向代理做鉴权的场景）
   ELK_HTTP_DISABLED_TOOLS  全局禁用的工具，逗号分隔，如 code_prepare
   ELK_HTTP_ALLOWED_ORIGINS 允许的 Origin（逗号分隔）；带 Origin 头且不在列表中的请求拒绝（防 DNS rebinding）
@@ -49,6 +51,7 @@ HOST = os.environ.get("ELK_HTTP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ELK_HTTP_PORT") or 8765)
 PATH = "/" + os.environ.get("ELK_HTTP_PATH", "/mcp").strip("/")
 TOKENS_FILE = os.environ.get("ELK_HTTP_TOKENS_FILE", "")
+TOKENS_ENV = os.environ.get("ELK_HTTP_TOKENS", "").strip()
 NO_AUTH = os.environ.get("ELK_HTTP_NO_AUTH", "").lower() in ("1", "true", "yes")
 DISABLED = {t.strip() for t in os.environ.get("ELK_HTTP_DISABLED_TOOLS", "").split(",") if t.strip()}
 ORIGINS = {o.strip().rstrip("/") for o in os.environ.get("ELK_HTTP_ALLOWED_ORIGINS", "").split(",") if o.strip()}
@@ -65,29 +68,41 @@ def sha256(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-class Tokens:
-    """tokens 文件：{"tokens":[{"name":"alice","sha256":"...","prod":false,"admin":false}]}。
-    也接受明文 "token" 字段（不推荐）。按 mtime 自动重新加载，增删成员无需重启。"""
+def token_items(data):
+    """{"tokens":[{"name":"alice","sha256":"...","prod":false,"admin":false}]} 或直接是 tokens 数组。
+    也接受明文 "token" 字段（不推荐）；disabled=true 的跳过。"""
+    items = []
+    for t in (data.get("tokens", []) if isinstance(data, dict) else data):
+        digest = t.get("sha256") or (sha256(t["token"]) if t.get("token") else None)
+        if not t.get("name") or not digest or t.get("disabled"):
+            continue
+        items.append({"name": t["name"], "sha256": digest.lower(),
+                      "prod": t.get("prod") is True, "admin": t.get("admin") is True,
+                      "code": t.get("code") is not False})
+    return items
 
-    def __init__(self, path):
-        self.path, self.mtime, self.items, self.lock = path, None, [], threading.Lock()
+
+class Tokens:
+    """成员 token：tokens 文件按 mtime 自动重新加载，增删成员无需重启；ELK_HTTP_TOKENS 中的条目（static）
+    启动时读取一次，与文件合并。只配置环境变量时，镜像默认的 tokens 文件路径不存在也可以正常使用。"""
+
+    def __init__(self, path, static=None):
+        self.path, self.static, self.mtime, self.items, self.lock = path, static, None, [], threading.Lock()
 
     def _load(self):
+        if not self.path or (self.static is not None and not os.path.exists(self.path)):
+            if self.mtime != "env":
+                self.items, self.mtime = list(self.static or []), "env"
+                log("已加载 %d 个成员 token（ELK_HTTP_TOKENS）" % len(self.items))
+            return
         mtime = os.stat(self.path).st_mtime
         if mtime == self.mtime:
             return
         with open(self.path, encoding="utf-8") as f:
-            data = json.load(f)
-        items = []
-        for t in data.get("tokens", []):
-            digest = t.get("sha256") or (sha256(t["token"]) if t.get("token") else None)
-            if not t.get("name") or not digest or t.get("disabled"):
-                continue
-            items.append({"name": t["name"], "sha256": digest.lower(),
-                          "prod": t.get("prod") is True, "admin": t.get("admin") is True,
-                          "code": t.get("code") is not False})
-        self.items, self.mtime = items, mtime
-        log("已加载 %d 个成员 token（%s）" % (len(items), self.path))
+            items = token_items(json.load(f))
+        self.items, self.mtime = (self.static or []) + items, mtime
+        log("已加载 %d 个成员 token（%s%s）" % (len(self.items), self.path,
+                                          "，含 ELK_HTTP_TOKENS" if self.static is not None else ""))
 
     def lookup(self, token):
         with self.lock:
@@ -102,7 +117,7 @@ class Tokens:
         return None
 
 
-TOKENS = Tokens(TOKENS_FILE) if TOKENS_FILE else None
+TOKENS = Tokens(TOKENS_FILE) if TOKENS_FILE or TOKENS_ENV else None
 ANONYMOUS = {"name": "anonymous", "prod": True, "admin": True, "code": True}
 
 
@@ -358,7 +373,7 @@ def start_gitnexus():
 def gen_token(name):
     token = "elk_" + secrets.token_urlsafe(32)
     print("成员 %s 的 token（只显示这一次，请通过私密渠道发给对方）：\n\n  %s\n" % (name, token))
-    print("把下面这行加入 tokens 文件的 tokens 数组（需要查生产时把 prod 改为 true）：\n")
+    print("把下面这行加入 tokens 文件的 tokens 数组，或环境变量 ELK_HTTP_TOKENS 的数组（需要查生产时把 prod 改为 true）：\n")
     print("  " + json.dumps({"name": name, "sha256": sha256(token), "prod": False, "admin": False}))
 
 
@@ -367,9 +382,14 @@ def main():
         if len(sys.argv) != 3:
             sys.exit("用法: mcp_http.py gen-token <成员名>")
         return gen_token(sys.argv[2])
-    if not NO_AUTH and not TOKENS_FILE:
-        sys.exit("未配置 ELK_HTTP_TOKENS_FILE。团队共享必须启用 token 鉴权；"
+    if not NO_AUTH and not TOKENS:
+        sys.exit("未配置 ELK_HTTP_TOKENS 或 ELK_HTTP_TOKENS_FILE。团队共享必须启用 token 鉴权；"
                  "若前面已有反向代理做鉴权，可设置 ELK_HTTP_NO_AUTH=1。")
+    if TOKENS and TOKENS_ENV:
+        try:
+            TOKENS.static = token_items(json.loads(TOKENS_ENV))
+        except (ValueError, TypeError, AttributeError, KeyError) as e:
+            sys.exit("ELK_HTTP_TOKENS 不是合法的 tokens JSON（数组或 {\"tokens\": [...]}）：%s" % e)
     if TOKENS:
         TOKENS._load()  # 启动时校验并加载一次，文件有误时直接报错退出
         if not TOKENS.items:

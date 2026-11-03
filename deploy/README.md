@@ -13,42 +13,82 @@
 
 ## 1. 服务端部署
 
-### 方式一：Docker（推荐，任何系统）
+### 方式一：Docker（推荐，Linux 服务器）
 
-**一键脚本**（推荐）。第一次运行会从模板创建 `.env` 和 `config/envs.json` 然后退出，填好后再运行一次：构建镜像，`config/tokens.json` 不存在时生成一个管理员 token（只显示这一次），后台启动并等待 `/healthz` 就绪。宿主机不需要装 Python。
+构建与运行分开：**镜像在开发机或 CI 中从源码构建**，服务器上只放部署目录（一个 `docker-compose.yml`、`.env` 配置），用 docker compose 运行已构建好的镜像。服务器上不需要源码，也不需要预装 Python、node 或 gitnexus。不要在源码仓库的 `deploy/` 目录里直接启动 compose，`docker-up.sh` 检测到源码仓库会拒绝运行。
 
-```bash
-git clone <本仓库> /opt/elk-log-analysis && cd /opt/elk-log-analysis
-deploy/docker-up.sh                    # 首次：创建配置文件后退出
-deploy/docker-up.sh                    # 填好后：构建、生成管理员 token、启动
-deploy/docker-up.sh --target code      # 含源码分析；--tls 同时启动 Caddy；--publish 8765 内网直连
-deploy/docker-up.sh status | logs | down
+```
+开发机 / CI（源码仓库）                               Linux 服务器（部署目录，如 /opt/elk-mcp）
+deploy/build-image.sh ──镜像──▶ 镜像仓库 或 镜像包 ──▶ docker-up.sh → docker compose up -d
+                      └─部署包 elk-mcp-deploy-<标签>.tar.gz ─▶ 解压：compose、模板、启动脚本
 ```
 
-Windows（Docker Desktop）在 PowerShell 中运行，参数相同：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy\docker-up.ps1
-powershell -ExecutionPolicy Bypass -File deploy\docker-up.ps1 -Target code -Publish 8765
-```
-
-`--target`、`--tls`、`--publish` 会写进 `.env`（`ELK_IMAGE_TARGET`、`COMPOSE_PROFILES`、`ELK_HTTP_PUBLISH`），以后直接 `docker compose up -d` 也沿用同样的设置。
-
-**手动部署**：
+**① 构建镜像**（在源码仓库中执行，需要 Docker 与 buildx）：
 
 ```bash
-git clone <本仓库> /opt/elk-log-analysis && cd /opt/elk-log-analysis/deploy
-cp .env.example .env && chmod 600 .env            # 填 ELK_TEST_PASSWORD / ELK_PROD_PASSWORD
-cp config/envs.example.json config/envs.json      # 环境列表，密码只写 env:变量名
-cp config/tokens.example.json config/tokens.json  # 成员 token，见第 2 节
-docker compose up -d --build
+deploy/build-image.sh --save                      # 导出镜像包，适合服务器不能访问镜像仓库
+deploy/build-image.sh --image registry.example.com/ops/elk-mcp --push   # 推送到镜像仓库
+```
+
+- 镜像只含 Python 服务与 git（约 150MB），构建很快；源码定位所需的 node + gitnexus 在服务器上由 compose 安装，见下方「gitnexus」。
+- 默认为 `linux/amd64` 构建（Apple Silicon 开发机也能给 x86 服务器出镜像）；ARM 服务器加 `--platform linux/arm64`。
+- 标签默认是 `<提交短哈希>`（有未提交改动时加 `-dirty`），同时打 `latest` 标签；镜像带 OCI 标签 `org.opencontainers.image.revision`，可追溯到源码提交。
+- 产物都在 `dist/`：部署包 `elk-mcp-deploy-<标签>.tar.gz`（docker-compose.yml、`.env.example`、config 模板、Caddyfile、启动脚本，**不含**任何凭据），`--save` 时另有镜像包 `elk-mcp-image-<标签>.tar.gz`。部署包里的 `.env.example` 已预填本次的 `ELK_IMAGE`。
+- 只改 `scripts/` 时会复用已缓存的依赖层（apt），几秒即可完成。
+
+**② 服务器上部署**：把部署包（和镜像包）拷到服务器，解压到部署目录。部署包只有模板，覆盖解压不会冲掉已有的 `.env` 和 `config/*.json`。所有配置都写在部署目录的 `.env` 里（环境变量），见下方「配置」。
+
+```bash
+sudo tar -xzf elk-mcp-deploy-<标签>.tar.gz -C /opt && cd /opt/elk-mcp
+sudo ./docker-up.sh --load /tmp/elk-mcp-image-<标签>.tar.gz   # 首次：载入镜像，创建 .env 后退出
+sudo ./docker-up.sh                                            # 填好后：生成管理员 token、启动、等待就绪
+sudo ./docker-up.sh --image registry.example.com/ops/elk-mcp:<哈希>   # 用镜像仓库时改用 --image
+sudo ./docker-up.sh status | logs | down
+```
+
+一键脚本第一次运行会从模板创建 `.env` 然后退出，填好后再运行：检查 ELK 环境已配置，镜像不在本机时从镜像仓库拉取，安装 gitnexus（见下方，版本没变时跳过）并在容器内校验，还没有成员 token 时生成一个管理员 token（只显示这一次，sha256 写入 `.env` 的 `ELK_HTTP_TOKENS`），后台启动并等待 `/healthz` 就绪。`--load` 会把 `ELK_IMAGE` 设为镜像包里的镜像；`--image`、`--tls`（同时启动 Caddy）、`--publish 8765`（内网直连）会写进 `.env`（`ELK_IMAGE`、`COMPOSE_PROFILES`、`ELK_HTTP_PUBLISH`），以后直接 `docker compose up -d` 也沿用同样的设置。
+
+Windows（Docker Desktop）在部署目录用 PowerShell 运行 `docker-up.ps1`，参数为 `-Image`、`-Load`、`-Tls`、`-Publish`。
+
+**配置**：elk-mcp 容器的参数全部来自部署目录的 `.env`（compose 以 `env_file` 传入容器），完整写法见 `.env.example`。修改后运行 `./docker-up.sh`（或 `docker compose up -d`）重建容器生效。
+
+| 配置 | 环境变量 | 说明 |
+|---|---|---|
+| ELK 环境 | `ELK_ENVS`、`ELK_DEFAULT_ENV`、`ELK_<环境>_URL` / `_INDEX` / `_USERNAME` / `_PASSWORD`（或 `_API_KEY`）、`ELK_MODE` | 每个环境一组 `ELK_<环境名大写>_*` 变量，未写的项回落到全局 `ELK_<KEY>`；也可以用一个 JSON 数组 `ELK_ENVIRONMENTS`。其余可选项见 [references/mcp-config.md](../references/mcp-config.md) |
+| 访问 MCP 的成员 token | `ELK_HTTP_TOKENS` | JSON 数组，每个成员 `{"name","sha256","prod","admin","code"}`，只存 sha256，见[第 2 节](#2-成员管理) |
+| GitLab 仓库同步 | `ELK_GITLAB_URL`、`ELK_GITLAB_TOKEN`（或账号密码）、`ELK_GITLAB_GROUPS` 等 | 见[第 4 节](#4-gitlab-仓库同步与服务端-gitnexus) |
+| 数据存储目录 | `ELK_DATA_DIR`、`ELK_REPOS_DIR` | 默认 Docker 数据卷 `elk-mcp_elk-data`、`elk-mcp_elk-repos`；写宿主机绝对路径则改用该目录（`docker-up.sh` 会创建并授权给容器用户 10001）。容器内固定为 `/data`、`/repos` |
+| gitnexus 安装 | `ELK_GITNEXUS_VERSION`、`ELK_NODE_IMAGE`、`ELK_NPM_REGISTRY` | 默认即可，见下方「gitnexus」 |
+| 镜像与端口 | `ELK_IMAGE`、`ELK_HTTP_PUBLISH`、`COMPOSE_PROFILES` | 一般由 `docker-up.sh` 的 `--image` / `--load` / `--publish` / `--tls` 写入 |
+| HTTP 服务 | `ELK_HTTP_DISABLED_TOOLS`、`ELK_HTTP_ALLOWED_ORIGINS`、`ELK_HTTP_CERT` / `ELK_HTTP_KEY` | 证书等文件放在 `config/`（容器内 `/config`） |
+
+也可以继续用文件：`config/envs.json`（环境，密码写 `env:变量名`）和 `config/tokens.json`（成员 token）。两种方式同时存在时，ELK 环境以环境变量为准，成员 token 合并生效。文件方式的好处是修改 `tokens.json` 不用重启。
+
+**gitnexus**（`code_*` 源码定位与 `/gitnexus/mcp`）：默认服务器上没有 node / gitnexus，由 `docker-compose.yml` 中的一次性服务 `gitnexus-install` 安装，不需要单独配置：
+
+- `gitnexus-install` 用官方 `node:22-bookworm` 镜像执行 `npm install -g gitnexus@<版本>`，连同 node 一起装进数据卷 `elk-mcp_gitnexus-tools`。elk-mcp 等它成功结束后才启动，只读挂载到 `/opt/gitnexus`（镜像已设好 `ELK_CODE_NODE`、`ELK_CODE_GITNEXUS`、`ELK_CODE_ROOT=/repos`、`GITNEXUS_HOME=/data/gitnexus`、`ELK_GITNEXUS_MCP=1`）。node 镜像与 elk-mcp 镜像同为 Debian bookworm，安装时编译的原生模块可以直接运行。
+- 首次安装需要几分钟，`docker-up.sh` 会实时显示 npm 输出，装完在容器里实际运行一次 `gitnexus --version` 校验。之后每次启动时版本与 node 都没变就直接跳过；先装到临时目录再整体替换，安装失败不会破坏已有版本。
+- `.env` 可设置 `ELK_GITNEXUS_VERSION`（默认 1.6.12）、`ELK_NODE_IMAGE`（默认 `node:22-bookworm`）、`ELK_NPM_REGISTRY`（国内可用 `https://registry.npmmirror.com`）。改版本后运行 `./docker-up.sh`，装好新版本会自动重启 elk-mcp；直接用 `docker compose up -d` 时需再执行 `docker compose restart elk-mcp`。
+- 需要服务器能访问 Docker Hub 与 npm 源；内网服务器把 `ELK_NODE_IMAGE`、`ELK_NPM_REGISTRY` 指向内部镜像仓库与 npm 私服即可。
+- 索引登记在 `/data/gitnexus`（随 `ELK_DATA_DIR`），与宿主机 `~/.gitnexus` 互不影响。安装出问题时 `docker volume rm elk-mcp_gitnexus-tools` 后重新运行 `./docker-up.sh` 即可重装。
+
+**手动部署**（在部署目录中）：
+
+```bash
+cp .env.example .env && chmod 600 .env            # 填 ELK_IMAGE、ELK 环境与密码、ELK_HTTP_TOKENS（见第 2 节）、GitLab 令牌等
+docker load -i /tmp/elk-mcp-image-<标签>.tar.gz  # 用镜像仓库时跳过，up 会自动拉取
+docker compose up -d
 curl http://127.0.0.1:8765/healthz                # 返回 ok
 ```
 
-- **文件权限**：容器以 uid 10001 运行，`config/` 下的文件必须让它可读。推荐执行 `sudo chown 10001:10001 config/*.json && chmod 600 config/*.json`，也就是只有容器用户可读。用 `chmod 644` 也能运行，但日志里会有权限提示；这两个文件本身不含密码。密码放在 `.env` 里，`.env` 只由宿主机上的 compose 读取，保持 600 即可。
-- **HTTPS**：服务器有公网域名时，在 `.env` 中设置 `ELK_DOMAIN`，然后运行 `docker compose --profile tls up -d --build`，Caddy 会自动申请证书。纯内网的做法见 `Caddyfile` 中的注释，也可以用 `ELK_HTTP_CERT`/`ELK_HTTP_KEY` 由服务直接提供 HTTPS。
+**升级**：重新执行 ① 构建新标签，在服务器上解压新部署包，再 `./docker-up.sh --load <新镜像包>` 或 `--image <新标签>`；compose 发现镜像变化会重建容器，数据卷保留。回滚时用 `--image` 指回旧标签。
+
+**从旧版迁移**（以前在源码仓库 `deploy/` 下 `docker compose up -d --build`）：先在旧目录执行 `docker compose down`，把旧目录的 `.env`、`config/envs.json`、`config/tokens.json` 复制到新部署目录，再运行 `./docker-up.sh`；旧的文件配置照常生效，之后可以逐步改成环境变量。compose 项目名固定为 `elk-mcp`，数据卷变为 `elk-mcp_elk-data` 等，缓存、索引和同步的仓库会自动重建；想沿用旧数据卷（`deploy_elk-data`、`deploy_elk-repos`），在 `.env` 中设置 `COMPOSE_PROJECT_NAME=deploy`。旧 `.env` 里的 `ELK_IMAGE_TARGET` 已不再使用，改设 `ELK_IMAGE`；不再区分 base / code 镜像，gitnexus 由 compose 安装。
+
+- **文件权限**：`.env` 含密码和 token，保持 600，只由宿主机上的 compose 读取。容器以 uid 10001 运行：用宿主机目录做 `ELK_DATA_DIR` / `ELK_REPOS_DIR`，或使用 `config/` 下的文件时，需要让它可读写，`sudo ./docker-up.sh` 会自动 `chown 10001:10001`（文件同时 `chmod 600`）。
+- **HTTPS**：服务器有公网域名时，在 `.env` 中设置 `ELK_DOMAIN`，然后运行 `./docker-up.sh --tls`（或 `docker compose --profile tls up -d`），Caddy 会自动申请证书。纯内网的做法见 `Caddyfile` 中的注释，也可以用 `ELK_HTTP_CERT`/`ELK_HTTP_KEY` 由服务直接提供 HTTPS。
 - **不走代理、内网直连**：把 `.env` 中的 `ELK_HTTP_PUBLISH` 设为 `8765`，即监听所有网卡。
-- **需要源码定位和调用链分析**：用 `ELK_IMAGE_TARGET=code docker compose up -d --build`，并配置 GitLab 仓库同步，见[第 4 节](#4-gitlab-仓库同步与服务端-gitnexus)。
+- **需要源码定位和调用链分析**：gitnexus 已默认安装，再配置 GitLab 仓库同步即可，见[第 4 节](#4-gitlab-仓库同步与服务端-gitnexus)。
 - **常驻运行**：容器配置了 `restart: unless-stopped`，进程退出会自动拉起，宿主机重启后随 Docker 一起恢复；只有手动 `down` 或 `stop` 后才不再启动。前提是 Docker 本身开机自启：
   - Linux：`sudo systemctl enable docker`。
   - macOS / Windows 的 Docker Desktop：在设置中勾选 *Start Docker Desktop when you sign in*。Docker Desktop 跟随用户登录启动，没人登录时服务不会运行。如果 Windows 服务器需要无人登录也常驻，可以配置开机自动登录，或改用下面原生部署里的计划任务方式。
@@ -126,7 +166,9 @@ python3 scripts/mcp_http.py gen-token alice
 命令会输出两样东西：
 
 1. **token**：只显示一次，通过私密渠道发给成员。
-2. **一行 JSON**：追加到 `config/tokens.json` 的 `tokens` 数组。
+2. **一行 JSON**：追加到 `.env` 中 `ELK_HTTP_TOKENS` 的 JSON 数组（逗号分隔），然后运行 `./docker-up.sh` 重建容器；使用 `config/tokens.json` 时追加到其 `tokens` 数组。
+
+Docker 部署时在部署目录执行 `docker compose exec elk-mcp python /app/scripts/mcp_http.py gen-token alice`，宿主机不需要 Python。
 
 | 字段 | 含义 |
 |---|---|
@@ -135,7 +177,7 @@ python3 scripts/mcp_http.py gen-token alice
 | `code: false` | 禁止查看源码：`code_*` 和 `/gitnexus/mcp` 都会被拒绝（默认允许） |
 | `disabled: true` | 临时停用该成员，删除该行则永久移除 |
 
-修改 `tokens.json` 后自动生效。Docker 部署挂载的是整个目录，编辑器替换文件也能被感知。
+`ELK_HTTP_TOKENS` 修改后要重建容器（几秒钟）才生效；`tokens.json` 修改后自动生效，不用重启（Docker 部署挂载的是整个目录，编辑器替换文件也能被感知）。两者可以同时使用，成员合并生效。
 
 ## 3. 成员客户端配置
 
@@ -241,7 +283,7 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
    docker compose run --rm elk-mcp python /app/scripts/elk.py repo-sync --check
    ```
    原生部署时执行 `python3 scripts/elk.py --env-file deploy/.env repo-sync --check`。
-4. **启动**：执行 `ELK_IMAGE_TARGET=code docker compose up -d --build`。服务启动约 15 秒后开始第一次同步，之后每 6 小时同步一次。
+4. **启动**：在部署目录执行 `./docker-up.sh`。服务启动约 15 秒后开始第一次同步，之后每 6 小时同步一次。
 
 ### 同步规则
 
@@ -287,8 +329,8 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 
 - **必须走 HTTPS**（或只在 VPN / 内网中开放）。token 是 Bearer 凭据，明文 HTTP 下可以被嗅探。
 - 生产环境建议在 Kibana 中**单独建一个只读账号**，并配置 `max_size`。服务端的 `prod` 开关防的是误用，不能代替 ES 侧的权限控制。
-- `.env`、`config/envs.json`、`config/tokens.json` 已加入 `.gitignore`；`.dockerignore` 保证它们不会进入构建上下文。
-- 成员离职时，删除 `tokens.json` 中对应的行即可，立即生效。
+- `.env`、`config/envs.json`、`config/tokens.json` 已加入 `.gitignore`；`.dockerignore` 保证它们不会进入构建上下文，部署包里也不含这些文件。
+- 成员离职时，删除 `ELK_HTTP_TOKENS` 中对应的项并运行 `./docker-up.sh`；用 `tokens.json` 时删除对应的行即可立即生效。
 
 ## 6. 运维
 
@@ -296,7 +338,7 @@ GitLab API ──列出令牌有权限的项目──▶ 部分 clone / fetch �
 |---|---|
 | 看日志（每次工具调用一行：成员、工具、环境、耗时） | `docker compose logs -f elk-mcp`、`journalctl -u elk-mcp -f`，或 Windows 上的 `deploy\data\elk-mcp.log` |
 | 结构化调用日志 | 容器内 `/data/cache/mcp.log`（不含参数值和日志内容） |
-| 启停与状态（Docker） | `deploy/docker-up.sh status`、`logs`、`down`，Windows 用 `deploy\docker-up.ps1` 加同样的参数 |
-| 升级 | `git pull && docker compose up -d --build`（或重新运行 `deploy/docker-up.sh`），成员侧无需任何改动 |
+| 启停与状态（Docker） | 部署目录中 `./docker-up.sh status`、`logs`、`down`，Windows 用 `docker-up.ps1` 加同样的参数 |
+| 升级 | 源码仓库 `deploy/build-image.sh` 构建新镜像，服务器部署目录 `./docker-up.sh --load <镜像包>` 或 `--image <新标签>`，见第 1 节；成员侧无需任何改动 |
 | 服务端自检 | 用 admin token 调用 `elk_doctor`，或 `docker compose exec elk-mcp python /app/scripts/elk.py doctor` |
 | 客户端连不上 | 先 `curl https://<域名>/healthz`；返回 401 说明 token 错误或已停用；再用 `claude mcp list` 查看具体报错 |
