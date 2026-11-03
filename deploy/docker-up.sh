@@ -121,13 +121,20 @@ gen_admin_token() {
   ADMIN_TOKEN=$token
 }
 
-# 容器以 uid 10001 运行，Linux 上 bind mount 按宿主机权限判断；Docker Desktop 不受影响。
-# 涉及：config/ 下实际使用的 envs.json / tokens.json，以及 ELK_DATA_DIR / ELK_REPOS_DIR 写成宿主机目录时
+# 存储目录写成宿主机路径时预先创建：否则 Docker 会以 root 自动创建，elk-mcp（uid 10001）无法写入。
+# ELK_DATA_DIR / ELK_REPOS_DIR 由 elk-mcp 读写，需授权给 10001；ELK_GITNEXUS_TOOLS_DIR / ELK_CADDY_DIR
+# 由以 root 运行的 gitnexus-install / caddy 写入，只需存在。config/ 下实际使用的 json 文件同样授权给 10001。
+# Linux 上 bind mount 按宿主机权限判断；Docker Desktop 不受影响。
 prepare_dirs() {
   dirs=""
-  for v in ELK_DATA_DIR ELK_REPOS_DIR; do
+  for v in ELK_DATA_DIR ELK_REPOS_DIR ELK_GITNEXUS_TOOLS_DIR ELK_CADDY_DIR; do
     d=$(env_get "$v")
-    case "$d" in /*) mkdir -p "$d"; dirs="$dirs $d" ;; esac
+    case "$d" in
+      "") continue ;;
+      /*) mkdir -p "$d" ;;
+      *) die "$v 需要写宿主机绝对路径（当前：$d），或删掉这一行改用 Docker 数据卷" ;;
+    esac
+    case "$v" in ELK_DATA_DIR|ELK_REPOS_DIR) dirs="$dirs $d" ;; esac
   done
   files=""
   for f in config/envs.json config/tokens.json; do

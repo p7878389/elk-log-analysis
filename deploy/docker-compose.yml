@@ -34,7 +34,7 @@ services:
       NPM_CONFIG_UPDATE_NOTIFIER: "false"
       NPM_CONFIG_FUND: "false"
     volumes:
-      - gitnexus-tools:/tools
+      - ${ELK_GITNEXUS_TOOLS_DIR:-gitnexus-tools}:/tools
     command:
       - sh
       - -ec
@@ -76,12 +76,12 @@ services:
     #   - "kibana-test.example.com:10.0.0.10"
     #   - "kibana.example.com:10.0.0.10"
     volumes:
-      - gitnexus-tools:/opt/gitnexus:ro      # gitnexus-install 安装的 node + gitnexus（只读）
+      # 存储目录：默认 Docker 数据卷；.env 中 ELK_*_DIR 写宿主机绝对路径则改用该目录（见 .env.example「存储目录」）
+      - ${ELK_GITNEXUS_TOOLS_DIR:-gitnexus-tools}:/opt/gitnexus:ro   # gitnexus-install 安装的 node + gitnexus（只读）
+      - ${ELK_DATA_DIR:-elk-data}:/data      # 缓存（cache/worktrees 下的分支副本与 GitNexus 索引）、日志、索引登记表
+      - ${ELK_REPOS_DIR:-elk-repos}:/repos   # GitLab clone 下来的仓库（部分 clone）
       # 可选：改用文件配置时放 envs.json / tokens.json，以及证书、SSH 私钥等；挂目录而非单文件，tokens 修改后自动生效
       - ./config:/config:ro
-      # 数据目录：默认 Docker 数据卷；.env 中 ELK_DATA_DIR / ELK_REPOS_DIR 写绝对路径则改用宿主机目录
-      - ${ELK_DATA_DIR:-elk-data}:/data      # 调用日志、worktree、GitNexus 索引与登记表（GITNEXUS_HOME=/data/gitnexus）
-      - ${ELK_REPOS_DIR:-elk-repos}:/repos   # GitLab 同步下来的仓库（部分 clone）
       # 不用 GitLab 令牌、改用 SSH 拉取已有仓库时，挂载只读 deploy key：
       # - ~/.ssh/elk_deploy_key:/home/elk/.ssh/id_ed25519:ro
       # - ~/.ssh/known_hosts:/home/elk/.ssh/known_hosts:ro
@@ -95,7 +95,7 @@ services:
     ports: ["80:80", "443:443"]
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
+      - ${ELK_CADDY_DIR:-caddy-data}:/data   # 自动申请的 HTTPS 证书
     depends_on:
       elk-mcp:
         condition: service_healthy

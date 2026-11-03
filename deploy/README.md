@@ -57,12 +57,32 @@ Windows（Docker Desktop）在部署目录用 PowerShell 运行 `docker-up.ps1`�
 | ELK 环境 | `ELK_ENVS`、`ELK_DEFAULT_ENV`、`ELK_<环境>_URL` / `_INDEX` / `_USERNAME` / `_PASSWORD`（或 `_API_KEY`）、`ELK_MODE` | 每个环境一组 `ELK_<环境名大写>_*` 变量，未写的项回落到全局 `ELK_<KEY>`；也可以用一个 JSON 数组 `ELK_ENVIRONMENTS`。其余可选项见 [references/mcp-config.md](../references/mcp-config.md) |
 | 访问 MCP 的成员 token | `ELK_HTTP_TOKENS` | JSON 数组，每个成员 `{"name","sha256","prod","admin","code"}`，只存 sha256，见[第 2 节](#2-成员管理) |
 | GitLab 仓库同步 | `ELK_GITLAB_URL`、`ELK_GITLAB_TOKEN`（或账号密码）、`ELK_GITLAB_GROUPS` 等 | 见[第 4 节](#4-gitlab-仓库同步与服务端-gitnexus) |
-| 数据存储目录 | `ELK_DATA_DIR`、`ELK_REPOS_DIR` | 默认 Docker 数据卷 `elk-mcp_elk-data`、`elk-mcp_elk-repos`；写宿主机绝对路径则改用该目录（`docker-up.sh` 会创建并授权给容器用户 10001）。容器内固定为 `/data`、`/repos` |
+| 存储目录 | `ELK_REPOS_DIR`、`ELK_DATA_DIR`、`ELK_GITNEXUS_TOOLS_DIR`、`ELK_CADDY_DIR` | 默认 Docker 数据卷，写宿主机绝对路径则改用该目录，见下方「存储目录」 |
 | gitnexus 安装 | `ELK_GITNEXUS_VERSION`、`ELK_NODE_IMAGE`、`ELK_NPM_REGISTRY` | 默认即可，见下方「gitnexus」 |
 | 镜像与端口 | `ELK_IMAGE`、`ELK_HTTP_PUBLISH`、`COMPOSE_PROFILES` | 一般由 `docker-up.sh` 的 `--image` / `--load` / `--publish` / `--tls` 写入 |
 | HTTP 服务 | `ELK_HTTP_DISABLED_TOOLS`、`ELK_HTTP_ALLOWED_ORIGINS`、`ELK_HTTP_CERT` / `ELK_HTTP_KEY` | 证书等文件放在 `config/`（容器内 `/config`） |
 
 也可以继续用文件：`config/envs.json`（环境；密码可直接写明文，也可写 `env:变量名` 引用 `.env` 中的值）和 `config/tokens.json`（成员 token）。两种方式同时存在时，ELK 环境以环境变量为准（`.env` 中留着 `ELK_ENVS` / `ELK_ENVIRONMENTS` 时 `envs.json` 不生效，用文件时要注释掉模板里的这几行），成员 token 合并生效。文件方式的好处是修改 `tokens.json` 不用重启。
+
+**存储目录**：默认都用 Docker 数据卷（`docker volume ls` 中的 `elk-mcp_*`），在 `.env` 中写宿主机绝对路径即可改到指定磁盘：
+
+| 变量 | 容器内 | 内容 | 默认数据卷 |
+|---|---|---|---|
+| `ELK_REPOS_DIR` | `/repos` | GitLab clone 下来的仓库（部分 clone） | `elk-mcp_elk-repos` |
+| `ELK_DATA_DIR` | `/data` | `cache/worktrees` 下的分支只读副本与 GitNexus 索引（每个仓库约 0.5G，占用最大）、同步与索引日志、调用日志 `cache/mcp.log`、索引登记表 `gitnexus/` | `elk-mcp_elk-data` |
+| `ELK_GITNEXUS_TOOLS_DIR` | `/opt/gitnexus` | `gitnexus-install` 安装的 node + gitnexus（约 300MB） | `elk-mcp_gitnexus-tools` |
+| `ELK_CADDY_DIR` | Caddy 的 `/data` | 自动申请的 HTTPS 证书（`--tls` 时） | `elk-mcp_caddy-data` |
+
+例如全部放到 `/srv/elk-mcp` 下：
+
+```ini
+ELK_REPOS_DIR=/srv/elk-mcp/repos
+ELK_DATA_DIR=/srv/elk-mcp/data
+ELK_GITNEXUS_TOOLS_DIR=/srv/elk-mcp/gitnexus-tools
+ELK_CADDY_DIR=/srv/elk-mcp/caddy
+```
+
+`sudo ./docker-up.sh` 会创建这些目录，并把 `ELK_REPOS_DIR`、`ELK_DATA_DIR` 授权给容器用户 uid 10001（另外两个由以 root 运行的容器写入）。改目录后原数据卷中的内容不会自动迁移：仓库重新同步、gitnexus 重新安装、索引重新构建；需要保留时先停服务，再把 `docker volume inspect elk-mcp_elk-data` 显示的 Mountpoint 下的内容复制到新目录。
 
 **gitnexus**（`code_*` 源码定位与 `/gitnexus/mcp`）：默认服务器上没有 node / gitnexus，由 `docker-compose.yml` 中的一次性服务 `gitnexus-install` 安装，不需要单独配置：
 
@@ -85,7 +105,7 @@ curl http://127.0.0.1:8765/healthz                # 返回 ok
 
 **从旧版迁移**（以前在源码仓库 `deploy/` 下 `docker compose up -d --build`）：先在旧目录执行 `docker compose down`，把旧目录的 `.env`、`config/envs.json`、`config/tokens.json` 复制到新部署目录，再运行 `./docker-up.sh`；旧的文件配置照常生效，之后可以逐步改成环境变量。compose 项目名固定为 `elk-mcp`，数据卷变为 `elk-mcp_elk-data` 等，缓存、索引和同步的仓库会自动重建；想沿用旧数据卷（`deploy_elk-data`、`deploy_elk-repos`），在 `.env` 中设置 `COMPOSE_PROJECT_NAME=deploy`。旧 `.env` 里的 `ELK_IMAGE_TARGET` 已不再使用，改设 `ELK_IMAGE`；不再区分 base / code 镜像，gitnexus 由 compose 安装。
 
-- **文件权限**：`.env` 含密码和 token，保持 600，只由宿主机上的 compose 读取。容器以 uid 10001 运行：用宿主机目录做 `ELK_DATA_DIR` / `ELK_REPOS_DIR`，或使用 `config/` 下的文件时，需要让它可读写，`sudo ./docker-up.sh` 会自动 `chown 10001:10001`（文件同时 `chmod 600`）。
+- **文件权限**：`.env` 含密码和 token，保持 600，只由宿主机上的 compose 读取。容器以 uid 10001 运行：用宿主机目录做 `ELK_DATA_DIR` / `ELK_REPOS_DIR`，或使用 `config/` 下的文件时，需要让它可读写，`sudo ./docker-up.sh` 会自动 `chown 10001:10001`（文件同时 `chmod 600`）。已有目录里由 root 创建的子目录不会被改动，必要时手动 `sudo chown -R 10001:10001 <目录>`。
 - **HTTPS**：服务器有公网域名时，在 `.env` 中设置 `ELK_DOMAIN`，然后运行 `./docker-up.sh --tls`（或 `docker compose --profile tls up -d`），Caddy 会自动申请证书。纯内网的做法见 `Caddyfile` 中的注释，也可以用 `ELK_HTTP_CERT`/`ELK_HTTP_KEY` 由服务直接提供 HTTPS。
 - **不走代理、内网直连**：把 `.env` 中的 `ELK_HTTP_PUBLISH` 设为 `8765`，即监听所有网卡。
 - **需要源码定位和调用链分析**：gitnexus 已默认安装，再配置 GitLab 仓库同步即可，见[第 4 节](#4-gitlab-仓库同步与服务端-gitnexus)。
