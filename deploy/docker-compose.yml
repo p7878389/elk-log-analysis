@@ -62,6 +62,12 @@ services:
     depends_on:
       gitnexus-install:
         condition: service_completed_successfully
+    # gitnexus 由上面的 gitnexus-install 装在数据卷的 current/ 下（npm --prefix 布局：lib/node_modules/gitnexus、bin/node），
+    # 挂载到 /opt/gitnexus；node 取同一目录下的 bin/node，无需另设 ELK_CODE_NODE
+    environment:
+      ELK_CODE_GITNEXUS: /opt/gitnexus/current/lib/node_modules/gitnexus
+      ELK_GITNEXUS_MCP: "1"        # 托管 gitnexus MCP，在 /gitnexus/mcp 以成员 token 转发
+      PATH: /opt/gitnexus/current/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
     ports:
       # 默认只监听本机，由反向代理对外；内网直连在 .env 中设 ELK_HTTP_PUBLISH=8765
       - "${ELK_HTTP_PUBLISH:-127.0.0.1:8765}:8765"
@@ -70,8 +76,7 @@ services:
     #   - "kibana-test.example.com:10.0.0.10"
     #   - "kibana.example.com:10.0.0.10"
     volumes:
-      # 镜像约定 gitnexus 在 /opt/gitnexus/current（ELK_CODE_NODE / ELK_CODE_GITNEXUS 已在镜像中设置）
-      - gitnexus-tools:/opt/gitnexus:ro
+      - gitnexus-tools:/opt/gitnexus:ro      # gitnexus-install 安装的 node + gitnexus（只读）
       # 可选：改用文件配置时放 envs.json / tokens.json，以及证书、SSH 私钥等；挂目录而非单文件，tokens 修改后自动生效
       - ./config:/config:ro
       # 数据目录：默认 Docker 数据卷；.env 中 ELK_DATA_DIR / ELK_REPOS_DIR 写绝对路径则改用宿主机目录

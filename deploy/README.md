@@ -66,7 +66,7 @@ Windows（Docker Desktop）在部署目录用 PowerShell 运行 `docker-up.ps1`�
 
 **gitnexus**（`code_*` 源码定位与 `/gitnexus/mcp`）：默认服务器上没有 node / gitnexus，由 `docker-compose.yml` 中的一次性服务 `gitnexus-install` 安装，不需要单独配置：
 
-- `gitnexus-install` 用官方 `node:22-bookworm` 镜像执行 `npm install -g gitnexus@<版本>`，连同 node 一起装进数据卷 `elk-mcp_gitnexus-tools`。elk-mcp 等它成功结束后才启动，只读挂载到 `/opt/gitnexus`（镜像已设好 `ELK_CODE_NODE`、`ELK_CODE_GITNEXUS`、`ELK_CODE_ROOT=/repos`、`GITNEXUS_HOME=/data/gitnexus`、`ELK_GITNEXUS_MCP=1`）。node 镜像与 elk-mcp 镜像同为 Debian bookworm，安装时编译的原生模块可以直接运行。
+- `gitnexus-install` 用官方 `node:22-bookworm` 镜像执行 `npm install -g gitnexus@<版本>`，连同 node 一起装进数据卷 `elk-mcp_gitnexus-tools`。elk-mcp 等它成功结束后才启动，只读挂载到 `/opt/gitnexus`，并在 compose 中设置 `ELK_CODE_GITNEXUS`、`ELK_GITNEXUS_MCP=1`（node 取同一目录下的 `bin/node`；镜像本身只约定 `ELK_CODE_ROOT=/repos`、`GITNEXUS_HOME=/data/gitnexus`）。node 镜像与 elk-mcp 镜像同为 Debian bookworm，安装时编译的原生模块可以直接运行。
 - 首次安装需要几分钟，`docker-up.sh` 会实时显示 npm 输出，装完在容器里实际运行一次 `gitnexus --version` 校验。之后每次启动时版本与 node 都没变就直接跳过；先装到临时目录再整体替换，安装失败不会破坏已有版本。
 - `.env` 可设置 `ELK_GITNEXUS_VERSION`（默认 1.6.12）、`ELK_NODE_IMAGE`（默认 `node:22-bookworm`）、`ELK_NPM_REGISTRY`（国内可用 `https://registry.npmmirror.com`）。改版本后运行 `./docker-up.sh`，装好新版本会自动重启 elk-mcp；直接用 `docker compose up -d` 时需再执行 `docker compose restart elk-mcp`。
 - 需要服务器能访问 Docker Hub 与 npm 源；内网服务器把 `ELK_NODE_IMAGE`、`ELK_NPM_REGISTRY` 指向内部镜像仓库与 npm 私服即可。
