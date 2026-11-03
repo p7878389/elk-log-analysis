@@ -27,18 +27,21 @@ def add_filters(p):
     p.add_argument("--allow-slow", action="store_true",
                    help="生产环境 query 含前导通配或时间范围超过 7 天时，确认仍要执行")
     p.add_argument("--term", action="append", default=[], help="字段精确过滤 field=value，可重复")
-    p.add_argument("-i", "--index", help="覆盖环境默认索引")
+    p.add_argument("-i", "--index", help="覆盖环境默认索引；可用索引别名或关联索引名称（如 algo）")
     p.add_argument("--dsl", action="store_true", help="只打印 DSL 不执行")
 
 
 def add_output(p):
     p.add_argument("-n", "--size", type=int, default=50)
-    p.add_argument("--desc", action="store_true", help="取最新 N 条（默认按 time.keyword 升序取最早 N 条）")
+    p.add_argument("--desc", action="store_true", help="取最新 N 条（默认按 time.keyword 升序取最早 N 条，缺失时按 @timestamp）")
     p.add_argument("--full", action="store_true", help="完整消息与堆栈")
     p.add_argument("--source", dest="show_source", action="store_true", help="--full 时显示 _index/_id")
     p.add_argument("--json", action="store_true", help="输出原始 _source JSON")
     p.add_argument("--width", type=int, default=300, help="单行消息截断长度")
     p.add_argument("--columns", help="展示列，逗号分隔，默认 time.keyword,level,host.name,traceId,message")
+    p.add_argument("--related", choices=list(core.RELATED_MODES), default="auto",
+                   help="关联索引：auto 提示命中数/默认索引无结果时自动改查（trace 另按业务 ID 跨索引追踪），"
+                        "merge 合并展示，off 只查默认索引")
 
 
 def to_params(args):
@@ -155,7 +158,7 @@ def run(args):
     if args.cmd in ("search", "trace"):
         if args.dsl:
             return json.dumps(core.search_body(env, p, tz), ensure_ascii=False, indent=2)
-        return core.op_search(env, p, tz)
+        return core.op_trace(env, p, tz) if args.cmd == "trace" else core.op_search(env, p, tz)
     if args.cmd == "agg":
         if args.dsl:
             return json.dumps(core.agg_body(env, p, tz), ensure_ascii=False, indent=2)

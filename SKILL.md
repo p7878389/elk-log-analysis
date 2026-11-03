@@ -26,7 +26,7 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 - 工具名取决于 MCP 条目名：连接团队远程服务时为 `mcp__elk-mcp__<tool>`，本机部署为 `mcp__elk__<tool>`；以会话中实际存在的为准，若工具未加载，先用 ToolSearch 搜索 `elk`。
 - **MCP 不可用时**才退回命令行：`python3 ~/.claude/skills/elk-log-analysis/scripts/elk.py -e <env> <search|trace|agg|fields|...>`，参数同名（`--help` 查看）。
 - 环境配置：统一在 **cc-switch** 中管理——elk MCP 条目顶层的 `elk` 字段（JSON 对象：`default_env`、`defaults`、`fields`、`environments` 数组，每项一个环境：env/url/username/password/index…），服务启动时直接从 `~/.cc-switch/cc-switch.db` 只读读取。**不要**把它放进 `env`：env 的值只能是字符串，Claude Code 会跳过整个 elk 服务，cc-switch 同步 Codex 时也会丢弃。MCP env 中的 `ELK_ENVIRONMENTS` / 平铺 `ELK_ENVS` + `ELK_<ENV>_*` 仍兼容且优先；`~/.config/elk-log-analysis/envs.json` 为最后兜底。配置是**分层**的——环境项 > 全局（`defaults` / `ELK_<KEY>`）> 环境级别预设（按名称识别 dev/test/staging/prod，决定生产保护、代码分支、版本对齐）> 内置默认。`elk_envs {verbose:true}` 可以查看每项配置的来源，详见 `references/mcp-config.md`。用户要新增或修改环境、索引、密码时指引其在 cc-switch 界面编辑 elk MCP 的 JSON，**不要由 Claude 代填密码**。
-- 排序：明细默认按 `time.keyword` **升序**（取时间窗口内最早 N 条）；要看最新 N 条传 `desc: true`（展示仍为升序）。`since/until` 时间范围过滤与趋势聚合仍使用 `@timestamp`（date 类型）。
+- 排序：明细默认按 `time.keyword` **升序**（取时间窗口内最早 N 条），索引没有该字段时（如算法日志）依次按 `@timestamp`、写入顺序；要看最新 N 条传 `desc: true`（展示仍为升序）。`since/until` 时间范围过滤与趋势聚合仍使用 `@timestamp`（date 类型）。
 - 查询时 `index` 可传索引别名（`elk_envs` 输出中的 `index-alias`）或逗号分隔的多个索引。
 
 ## 1. 硬性规则
@@ -43,7 +43,8 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
    - 量级与趋势：`elk_agg {interval:"5m", level:"ERROR", since:"3h"}`
    - Top 异常来源：`elk_agg {field:"logger_name.keyword", level:"ERROR", since:"30m"}`
 3. **看明细**：`elk_search {level:"ERROR", query:"...", size:20}`；需要堆栈时 `full:true, size:3~5`。
-4. **串链路**：从代表性错误取 traceId → `elk_trace {trace_id:"..."}`。
+4. **串链路**：从代表性错误取 traceId → `elk_trace {trace_id:"..."}`。链路之后会按日志中的 detectId 等业务 ID 到关联索引（如算法日志 `beta-algo-*`）跨索引追踪，异步调用、回调丢失这类问题看这一段。
+   - **关联索引**：与默认索引同前缀的其他索引（默认 `beta-software-*` 时自动发现 `beta-algo-*`，名称 `algo`）。按 `query`/`host`/`trace` 检索时，结果末尾的“关联索引命中”提示要跟进；默认索引无结果时会自动改查关联索引；`index:"algo"` 直接查，`related:"merge"` 合并展示，`related:"off"` 只查默认索引。关联索引没有级别/traceId 字段时，`level` 等条件自动改为在 message 中按短语匹配。
 5. **对照代码**（日志不足以下结论时必做，见第 3 节）。
    - 根因取决于业务数据（状态、余额、配置、重复数据等）时，若已安装 `yearning-query` skill，按其「与 ELK 日志排查联动」一节，用日志中的业务 ID 经 Yearning 只读查询核对；环境与日志保持一致，查生产库同样需要用户明确要求。
 6. **输出结论**：环境与时间范围、影响量级（条数/趋势）、根因、证据（精简日志片段 + 代码位置与 commit）、修复建议。
@@ -83,7 +84,7 @@ description: 查询与分析 ELK（Elasticsearch/Kibana）中的应用日志，�
 
 ## 5. 常见问题
 
-- 返回为空：先 `elk_fields {grep:"trace"}` 核对字段名 → 放宽 `since` → 逐个去掉过滤条件；字段名不一致时在 cc-switch elk 对象的 `fields`（全局或环境内）覆盖。
+- 返回为空：先看结果中的关联索引提示（算法等服务的日志在 `beta-algo-*` 等关联索引里，`elk_indices` 可列出全部索引）→ `elk_fields {grep:"trace"}` 核对字段名 → 放宽 `since` → 逐个去掉过滤条件；字段名不一致时在 cc-switch elk 对象的 `fields`（全局或环境内）覆盖。
 - `fielddata is disabled on text fields`：agg 字段改用 `xxx.keyword`。
 - Kibana 模式 401/403：账号需有索引 `read` 权限及 Kibana Console 权限；用了 Space 时配置 `kibana_space`。
 - 证书错误：配置 `ca_cert`；仅内网测试环境使用 `verify_ssl: false`。

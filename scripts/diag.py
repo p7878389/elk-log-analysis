@@ -699,10 +699,11 @@ def run_doctor(fix=False, connectivity=True, confirm_production=False, days=7, c
 
 EXPORT_KEYS = ("URL", "MODE", "INDEX", "INDICES", "USERNAME", "PASSWORD", "API_KEY", "TIER", "ALIASES", "PRODUCTION",
                "MAX_SIZE", "TIMEOUT", "MASK", "VERIFY_SSL", "CA_CERT", "KIBANA_SPACE", "KIBANA_API", "PROXY",
-               "COLUMNS", "FIELDS", "BRANCH", "SERVICE_MAP", "ALIGN", "AUTO_INDEX")
+               "COLUMNS", "FIELDS", "BRANCH", "SERVICE_MAP", "ALIGN", "AUTO_INDEX",
+               "RELATED", "INDEX_FIELDS", "FOLLOW_KEYS")
 NUMERIC = ("MAX_SIZE", "TIMEOUT")
 BOOLEAN = ("PRODUCTION", "MASK", "VERIFY_SSL", "AUTO_INDEX")
-JSONISH = ("INDICES", "FIELDS", "SERVICE_MAP")
+JSONISH = ("INDICES", "FIELDS", "SERVICE_MAP", "INDEX_FIELDS")
 
 
 def export_array(cfg, inline_globals=True):
@@ -731,7 +732,9 @@ def export_array(cfg, inline_globals=True):
                 v = core._bool(v)
             elif key in JSONISH:
                 v = json.loads(v)
-            elif key in ("ALIASES", "COLUMNS"):
+            elif key == "RELATED":
+                v = core._related_conf(v, key)
+            elif key in ("ALIASES", "COLUMNS", "FOLLOW_KEYS"):
                 v = [x.strip() for x in str(v).split(",") if x.strip()]
             item[key.lower()] = v
         if name == cfg.get("default_env"):

@@ -111,6 +111,9 @@
 | `KIBANA_SPACE` / `KIBANA_API` | Kibana Space / 访问方式 `auto`（默认，Console 403 时改走搜索接口）、`console`、`search` | |
 | `PROXY` | HTTP 代理；不配则直连（忽略系统代理） | `http://127.0.0.1:7897` |
 | `COLUMNS` | 明细展示列 | 默认 `time.keyword,level,host.name,traceId,message` |
+| `RELATED` | 关联索引：`auto`（默认，按默认索引前缀自动发现同前缀的其他索引族，如 `beta-software-*` → `beta-algo-*`，名称 `algo`，缓存 10 分钟）、`off` 关闭，或 JSON 显式指定 | `{"algo":"beta-algo-*"}` |
+| `INDEX_FIELDS` | 按索引覆盖字段映射(JSON，键为索引通配)；值 `@message` 表示该条件在 message 中按短语匹配。未配置时自动探测：关联索引没有级别/traceId 字段时即按 `@message` 处理 | `{"beta-algo-*":{"level":"@message"}}` |
+| `FOLLOW_KEYS` | `elk_trace` 跨索引追踪时从链路日志提取业务 ID 的键，逗号分隔 | 默认 `detectId,dataId,orderId,orderNo,bizId,taskId,requestId` 等 |
 
 ## 只能按环境配置的项（`ELK_<ENV>_<KEY>`）
 

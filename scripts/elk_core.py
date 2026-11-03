@@ -5,6 +5,7 @@
 最后 ~/.config/elk-log-analysis/envs.json（ELK_CONFIG 可覆盖）。
 """
 import base64
+import fnmatch
 import getpass
 import json
 import os
@@ -14,6 +15,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,6 +58,21 @@ DEFAULT_SLOW_GUARD_DAYS = 7
 # 前导通配：*abc / field:*abc* / ?abc；单独的 * 或 field:*（ES 改写为 exists）不算
 LEADING_WILDCARD = re.compile(r"(?:^|[\s(:!+\-])[*?](?![\s)]|$)")
 QUOTED = re.compile(r'"(?:\\.|[^"\\])*"')
+
+# 关联索引：与默认索引同前缀的其他索引族（如默认 beta-software-* 时的 beta-algo-*），算法等非 Java 服务的日志常在这里
+RELATED_TTL = 600            # 自动发现结果与索引字段探测的缓存秒数
+RELATED_MAX = 8              # 自动发现的关联索引族上限，避免每次检索额外查询过多
+DATE_SUFFIX = re.compile(r"([-_.])\d{4}[-_.]\d{2}(?:[-_.]\d{2})?$")
+MESSAGE_FIELD = "@message"   # 字段映射为该值时改为在 message 中按短语匹配（该索引没有独立的级别/traceId 字段）
+RELATED_MODES = ("auto", "merge", "off")
+# elk_trace 跨索引追踪时，从链路日志中提取这些键的业务 ID，再到关联索引中按 ID 检索；FOLLOW_KEYS 可覆盖
+DEFAULT_FOLLOW_KEYS = ("detectId", "detect_id", "dataId", "orderId", "order_id", "orderNo", "order_no",
+                       "bizId", "biz_id", "taskId", "task_id", "requestId", "request_id")
+FOLLOW_MAX_IDS = 3
+FOLLOW_SHOW_ALL = 40         # 关联索引命中不超过该条数时全部展示，否则只展示开头、ERROR/WARN 与结尾
+LEVEL_IN_MESSAGE = re.compile(r"(?:^|[\s\]|-])(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)(?=[\s:|\]])")
+_RELATED_CACHE = {}          # env 名 → (时间, {名称: 索引通配})
+_PROFILE_CACHE = {}          # (env 名, 索引) → (时间, 字段映射覆盖)
 
 # 输出脱敏：手机号、身份证号
 MASK_RULES = [
@@ -103,6 +120,21 @@ def _json(v, label):
         raise ElkError("%s 不是合法 JSON" % label)
 
 
+def _related_conf(v, label):
+    """RELATED：auto（默认，按默认索引前缀自动发现）、off/false 关闭，或 JSON 对象 {名称: 索引通配} 显式指定。"""
+    if isinstance(v, dict):
+        return v
+    s = str(v).strip()
+    if s.lower() in ("auto", ""):
+        return "auto"
+    if s.lower() in ("off", "false", "0", "no", "none"):
+        return "off"
+    conf = _json(s, label)
+    if not isinstance(conf, dict):
+        raise ElkError("%s 应为 auto、off 或 JSON 对象 {\"algo\":\"beta-algo-*\"}" % label)
+    return conf
+
+
 def _secret_from_env(value, var):
     """MCP env 中的凭据值：支持明文、keychain:<service>/<account>、env:<VAR>。"""
     if value is None or value == "":
@@ -133,7 +165,8 @@ TIER_PRESETS = {
 }
 # 可放在全局（所有环境共用）的键；其余键只能按环境配置
 GLOBAL_KEYS = ("URL", "MODE", "INDEX", "INDICES", "USERNAME", "PASSWORD", "API_KEY", "VERIFY_SSL", "CA_CERT",
-               "KIBANA_SPACE", "KIBANA_API", "PROXY", "MAX_SIZE", "TIMEOUT", "MASK", "COLUMNS")
+               "KIBANA_SPACE", "KIBANA_API", "PROXY", "MAX_SIZE", "TIMEOUT", "MASK", "COLUMNS",
+               "RELATED", "INDEX_FIELDS", "FOLLOW_KEYS")
 ENV_ONLY_KEYS = ("TIER", "ALIASES", "PRODUCTION", "FIELDS", "BRANCH", "SERVICE_MAP", "ALIGN", "AUTO_INDEX")
 SYSTEM_KEYS = ("ENVS", "ENVIRONMENTS", "DEFAULT_ENV", "FIELDS", "CONFIG", "ENV")
 ENV_KEYS = GLOBAL_KEYS + ENV_ONLY_KEYS
@@ -297,6 +330,12 @@ def _flat_config(environ, notes):
             env["auto_index"] = _bool(g("AUTO_INDEX", global_ok=False))
         if g("COLUMNS"):
             env["columns"] = [c.strip() for c in g("COLUMNS").split(",") if c.strip()]
+        if g("RELATED"):
+            env["related"] = _related_conf(g("RELATED"), lbl(lookup("RELATED")[1]))
+        if g("INDEX_FIELDS"):
+            env["index_fields"] = _json(g("INDEX_FIELDS"), lbl(lookup("INDEX_FIELDS")[1]))
+        if g("FOLLOW_KEYS"):
+            env["follow_keys"] = [k.strip() for k in g("FOLLOW_KEYS").split(",") if k.strip()]
         env["kibana_url" if mode == "kibana" else "es_url"] = url
         for key, conv in (("CA_CERT", str), ("KIBANA_SPACE", str), ("KIBANA_API", str), ("PROXY", str),
                           ("MAX_SIZE", int), ("TIMEOUT", int)):
@@ -484,6 +523,12 @@ def describe_envs(cfg, verbose=False):
             aliases or "-", " ".join(tags)))
         for alias, real in env.get("indices", {}).items():
             lines.append("         index-alias %s -> %s" % (alias, real))
+        related = env.get("related", "auto")
+        if isinstance(related, dict):
+            for alias, real in related.items():
+                lines.append("         related %s -> %s" % (alias, real))
+        elif related == "off":
+            lines.append("         related off")
         if verbose:
             src = env.get("_src", {})
             keys = sorted(k for k in src if k not in ("password", "api_key"))
@@ -781,6 +826,16 @@ def check_slow_query(env, p, tz):
                        % (env["_name"], "；".join(reasons)))
 
 
+def _filter_clause(f, key, value):
+    if f[key] == MESSAGE_FIELD:  # 该索引没有独立字段（如算法日志的级别、业务 ID 都写在消息里）
+        return {"match_phrase": {f["message"]: value}}
+    if key == "host":
+        return _host_clause(f, value)
+    if key == "service":
+        return _service_clause(f, value)
+    return {"match_phrase": {f[key]: value}}
+
+
 def build_query(env, p, tz):
     """p: dict，键 query/since/until/level/service/trace/host/logger/terms。"""
     f = env["_fields"]
@@ -796,25 +851,129 @@ def build_query(env, p, tz):
         v = p.get(k)
         if v:
             values = [x.strip() for x in str(v).split(",") if x.strip()]
-            filt.append({"bool": {"should": [
-                _host_clause(f, x) if k == "host" else (_service_clause(f, x) if k == "service" else {"match_phrase": {f[k]: x}}) for x in values],
-                "minimum_should_match": 1}})
+            filt.append({"bool": {"should": [_filter_clause(f, k, x) for x in values], "minimum_should_match": 1}})
     for k, v in (p.get("terms") or {}).items():
         filt.append({"match_phrase": {k: v}})
     return {"bool": {"must": must or [{"match_all": {}}], "filter": filt}}
 
 
-def resolve_index(env, name=None):
-    """把索引别名解析为真实索引；支持逗号分隔多个，未知名称原样透传。"""
+def resolve_index(env, name=None, related=None):
+    """把索引别名解析为真实索引；支持逗号分隔多个，未知名称原样透传。索引别名优先于关联索引名称。"""
     if not name:
         return env.get("index", "*")
-    aliases = env.get("indices", {})
+    aliases = dict(related or {})
+    aliases.update(env.get("indices", {}))
     parts = [aliases.get(x.strip(), x.strip()) for x in str(name).split(",") if x.strip()]
     return ",".join(parts)
 
 
-def index_of(env, p):
-    return resolve_index(env, p.get("index"))
+def resolve_named(env, name=None, interactive=True):
+    """同 resolve_index，另外支持关联索引名称（如 index=algo → beta-algo-*）；只有出现未知的纯名称时才去发现关联索引。"""
+    related = None
+    if name and any(re.match(r"^\w+$", x.strip()) and x.strip() not in env.get("indices", {})
+                    for x in str(name).split(",")):
+        related = related_indices(env, interactive)
+    return resolve_index(env, name, related)
+
+
+def index_of(env, p, interactive=True):
+    return resolve_named(env, p.get("index"), interactive)
+
+
+# ---------------------------------------------------------------- 关联索引
+
+def related_mode(p):
+    mode = p.get("related") or "auto"
+    if mode is True:
+        return "merge"
+    if mode is False:
+        return "off"
+    if mode not in RELATED_MODES:
+        raise ElkError("related 只能是 %s" % "/".join(RELATED_MODES))
+    return mode
+
+
+def related_indices(env, interactive=True):
+    """关联索引 {名称: 索引通配}：RELATED 显式配置优先；未配置时按默认索引前缀自动发现同前缀的其他索引族
+    （默认 beta-software-* → beta-algo-*，名称取去掉前缀后的部分，即 algo），结果缓存；RELATED=off 关闭。"""
+    conf = env.get("related", "auto")
+    if isinstance(conf, dict):
+        return dict(conf)
+    if conf != "auto":
+        return {}
+    hit = _RELATED_CACHE.get(env["_name"])
+    if hit and time.time() - hit[0] < RELATED_TTL:
+        return dict(hit[1])
+    try:
+        found = _discover_related(env, interactive)
+    except ElkError:
+        found = {}  # 发现失败不影响主检索；同样缓存，避免每次检索都重试
+    _RELATED_CACHE[env["_name"]] = (time.time(), found)
+    return dict(found)
+
+
+def _discover_related(env, interactive):
+    patterns = [x.strip() for x in str(env.get("index", "*")).split(",") if x.strip()]
+    prefixes = sorted({pat.split("-", 1)[0] + "-" for pat in patterns
+                       if "-" in pat and not pat.startswith(("*", "?", "."))})
+    found = {}
+    for prefix in prefixes:
+        rows = call(env, "GET", "/_cat/indices/%s*?format=json&h=index" % prefix, interactive=interactive)
+        for row in sorted(rows or [], key=lambda r: r.get("index") or ""):
+            name = row.get("index") or ""
+            if not name or name.startswith(".") or any(fnmatch.fnmatchcase(name, pat) for pat in patterns):
+                continue
+            m = DATE_SUFFIX.search(name)
+            family = name[:m.start()] if m else name
+            pattern = family + m.group(1) + "*" if m else name
+            if pattern in found.values():
+                continue
+            if len(found) >= RELATED_MAX:
+                return found
+            found[family[len(prefix):] or family] = pattern
+    return found
+
+
+def _index_matches(index, pattern):
+    return any(x.strip() == pattern or fnmatch.fnmatchcase(x.strip(), pattern) for x in str(index).split(","))
+
+
+def env_for_index(env, index, interactive=True):
+    """按索引调整字段映射：INDEX_FIELDS 显式配置优先；否则用 _field_caps 探测，级别/traceId 字段在该索引中不存在时
+    改为在 message 中按短语匹配。查默认索引时不调整。"""
+    if not index or index == env.get("index", "*"):
+        return env
+    merged = dict(_missing_field_overrides(env, index, interactive))
+    for pattern, fields in (env.get("index_fields") or {}).items():
+        if _index_matches(index, pattern):
+            merged.update(fields)
+    if not merged:
+        return env
+    out = dict(env)
+    out["_fields"] = dict(env["_fields"], **merged)
+    return out
+
+
+def _missing_field_overrides(env, index, interactive):
+    key = (env["_name"], index)
+    hit = _PROFILE_CACHE.get(key)
+    if hit and time.time() - hit[0] < RELATED_TTL:
+        return hit[1]
+    out = {}
+    try:
+        caps = call(env, "GET", "/%s/_field_caps?fields=*" % index, interactive=interactive)
+        have = set((caps or {}).get("fields", {})) if isinstance(caps, dict) else set()
+    except ElkError:
+        have = set()
+    f = env["_fields"]
+    if have:  # 探测失败时不猜，保持原映射
+        for k in ("level", "trace"):
+            name = f.get(k) or ""
+            base = name[:-len(".keyword")] if name.endswith(".keyword") else name
+            if name != MESSAGE_FIELD and base not in have and base + ".keyword" not in have:
+                out[k] = MESSAGE_FIELD
+    _PROFILE_CACHE[key] = (time.time(), out)
+    return out
 
 
 # ---------------------------------------------------------------- output
@@ -850,6 +1009,12 @@ def mask(env, text):
     return text
 
 
+def _level_in_message(msg):
+    """没有级别字段的日志（如 '2026-11-02 08:24:59 - ERROR ...'）从消息开头提取级别用于展示。"""
+    m = LEVEL_IN_MESSAGE.search(str(msg or "")[:120])
+    return m.group(1) if m else None
+
+
 def format_hits(env, hits, tz, full=False, width=300, show_source=False, columns=None):
     """按 columns 逐列展示（字段逻辑名或原始字段名）；message/时间/级别不加括号。"""
     f = env["_fields"]
@@ -868,7 +1033,7 @@ def format_hits(env, hits, tz, full=False, width=300, show_source=False, columns
             if c in time_cols:
                 parts.append(str(v or fmt_ts(dig(s, f["timestamp"]), tz)))
             elif c == f["level"]:
-                parts.append("%-5s" % (v or "-"))
+                parts.append("%-5s" % (v or _level_in_message(dig(s, f["message"])) or "-"))
             elif c == f["message"]:
                 msg = str(v or "")
                 if not full and width > 0:
@@ -912,7 +1077,7 @@ def op_ping(env, interactive=True):
 
 
 def op_indices(env, pattern=None, limit=50, interactive=True):
-    pattern = resolve_index(env, pattern)
+    pattern = resolve_named(env, pattern, interactive)
     res = call(env, "GET", "/_cat/indices/%s?format=json&h=index,docs.count,store.size,health"
                "&s=index:desc" % pattern, interactive=interactive)
     return "\n".join("%-60s docs=%-12s size=%-10s %s" % (
@@ -921,7 +1086,7 @@ def op_indices(env, pattern=None, limit=50, interactive=True):
 
 
 def op_fields(env, index=None, grep=None, interactive=True):
-    res = call(env, "GET", "/%s/_field_caps?fields=*" % resolve_index(env, index),
+    res = call(env, "GET", "/%s/_field_caps?fields=*" % resolve_named(env, index, interactive),
                interactive=interactive)
     kw = grep.lower() if grep else None
     lines = []
@@ -932,38 +1097,224 @@ def op_fields(env, index=None, grep=None, interactive=True):
     return "\n".join(lines)
 
 
-def search_body(env, p, tz):
+def sort_clause(env, desc=False):
+    """主排序字段缺失时（如算法索引没有 time 字段）依次回退 @timestamp 与索引内写入顺序 _doc；
+    否则这些文档没有排序值，返回顺序任意，desc 也取不到真正最新的 N 条。"""
     f = env["_fields"]
+    order = "desc" if desc else "asc"
+    clauses = [{f["sort"]: {"order": order, "missing": "_last", "unmapped_type": "keyword"}}]
+    if f["timestamp"] != f["sort"]:
+        clauses.append({f["timestamp"]: {"order": order, "unmapped_type": "date"}})
+    clauses.append({"_doc": {"order": order}})
+    return clauses
+
+
+def search_body(env, p, tz):
     size = min(int(p.get("size") or 50), int(env.get("max_size", 500)))
     return {
         "size": size,
         "timeout": search_timeout(env),
         "track_total_hits": True,
-        "sort": [{f["sort"]: {"order": "desc" if p.get("desc") else "asc",
-                              "missing": "_last", "unmapped_type": "keyword"}}],
+        "sort": sort_clause(env, p.get("desc")),
         "query": build_query(env, p, tz),
     }
 
 
-def op_search(env, p, tz, interactive=True):
+def _search(env, p, tz, idx, interactive):
+    """执行一次明细检索，命中按时间升序返回（desc 取的是最新 N 条，翻转回升序便于按时间线阅读）。"""
+    res = call(env, "POST", "/%s/_search" % idx, search_body(env, p, tz), interactive=interactive)
+    hits = res.get("hits", {}).get("hits", []) if isinstance(res, dict) else []
+    return (list(reversed(hits)) if p.get("desc") else hits), res
+
+
+def _count(env, p, tz, idx, interactive):
+    body = {"size": 0, "timeout": search_timeout(env), "track_total_hits": True, "query": build_query(env, p, tz)}
+    return _total(call(env, "POST", "/%s/_search" % idx, body, interactive=interactive)) or 0
+
+
+def _ts(env, hit):
+    return str(dig(hit.get("_source", {}), env["_fields"]["timestamp"]) or "")
+
+
+def _merge_hits(env, groups, size, desc=False):
+    """多个索引的升序命中按 @timestamp 合并（同一时间戳保持各自原顺序），按 _id 去重，取最早/最新 size 条。"""
+    seen, merged = set(), []
+    for hits in groups:
+        for h in hits:
+            key = (h.get("_index"), h.get("_id"))
+            if h.get("_id") is not None and key in seen:
+                continue
+            seen.add(key)
+            merged.append(h)
+    merged.sort(key=lambda h: _ts(env, h))
+    return merged[-size:] if desc else merged[:size]
+
+
+def _related_hits(env, p, tz, interactive):
+    """按同样条件统计各关联索引的命中数，返回 [(名称, 索引, 该索引的 env, 条数)]（只含有命中的）与失败说明。"""
+    out, errors = [], []
+    for name, pattern in related_indices(env, interactive).items():
+        try:
+            renv = env_for_index(env, pattern, interactive)
+            n = _count(renv, p, tz, pattern, interactive)
+        except ElkError as e:
+            errors.append("%s(%s): %s" % (name, pattern, str(e).splitlines()[0]))
+            continue
+        if n:
+            out.append((name, pattern, renv, n))
+    return out, errors
+
+
+def _mapped_note(env, senv, idx, p):
+    keys = [k for k in ("level", "trace") if p.get(k) and senv["_fields"].get(k) == MESSAGE_FIELD
+            and env["_fields"].get(k) != MESSAGE_FIELD]
+    if not keys:
+        return None
+    return "# 注: %s 中没有 %s 字段，按该条件过滤时改为在 message 中按短语匹配" % (
+        idx, "/".join(env["_fields"][k] for k in keys))
+
+
+def search_result(env, p, tz, interactive=True):
+    """明细检索 + 关联索引：默认索引有结果时提示关联索引的命中数；没有结果时自动改查有命中的关联索引；
+    related=merge 时合并展示。只在按 query/host/trace 定位具体问题且未显式指定 index 时检查关联索引。"""
     check_slow_query(env, p, tz)
-    body = search_body(env, p, tz)
-    idx = index_of(env, p)
-    res = call(env, "POST", "/%s/_search" % idx, body, interactive=interactive)
-    hits = res.get("hits", {}).get("hits", [])
+    mode = related_mode(p)
+    idx = index_of(env, p, interactive)
+    senv = env_for_index(env, idx, interactive)
+    size = min(int(p.get("size") or 50), int(env.get("max_size", 500)))
+    hits, res = _search(senv, p, tz, idx, interactive)
+    r = {"env": senv, "index": idx, "hits": hits, "total": _total(res) or 0, "took": res.get("took") or 0,
+         "notes": [n for n in (_partial_note(env, res), _mapped_note(env, senv, idx, p)) if n]}
+    if mode == "off" or p.get("index") or not any(p.get(k) for k in ("query", "host", "trace")):
+        return r
+    related, errors = _related_hits(env, p, tz, interactive)
+    if errors:
+        r["notes"].append("# 注: 关联索引检查失败（不影响上面的结果）：%s" % "；".join(errors))
+    if not related:
+        return r
+    summary = ", ".join("%s(%s) %d 条" % (n, pat, c) for n, pat, _, c in related)
+    if mode == "auto" and hits:
+        r["notes"].append("# 关联索引命中：%s —— 传 index=<名称> 查看，或 related=merge 合并展示" % summary)
+        return r
+    groups = [hits] if hits else []
+    indexes = [idx] if hits else []
+    for name, pattern, renv, _ in related:
+        try:
+            rhits, rres = _search(renv, p, tz, pattern, interactive)
+        except ElkError as e:
+            r["notes"].append("# 注: 关联索引 %s(%s) 检索失败：%s" % (name, pattern, str(e).splitlines()[0]))
+            continue
+        groups.append(rhits)
+        indexes.append(pattern)
+        r["took"] += rres.get("took") or 0
+        r["notes"] += [n for n in (_partial_note(env, rres), _mapped_note(env, renv, pattern, p)) if n]
+    if not hits:
+        r["notes"].insert(0, "# 默认索引 %s 无结果，已自动改查关联索引：%s" % (idx, summary))
+    else:
+        r["notes"].insert(0, "# 已合并关联索引：%s" % summary)
+    r["hits"] = _merge_hits(env, groups, size, p.get("desc"))
+    r["index"] = ",".join(indexes)
+    r["total"] += sum(c for _, _, _, c in related)
+    return r
+
+
+def format_result(r, p, tz):
+    env = r["env"]
     head = "# env=%s index=%s total=%s shown=%d took=%sms" % (
-        env["_name"], idx, _total(res), len(hits), res.get("took"))
-    partial = _partial_note(env, res)
-    if partial:
-        head += "\n" + partial
+        env["_name"], r["index"], r["total"], len(r["hits"]), r["took"])
+    head = "\n".join([head] + r["notes"])
     if p.get("json"):
         return head + "\n" + mask(env, json.dumps(
-            [h.get("_source") for h in hits], ensure_ascii=False, indent=2))
-    # 降序时取的是最新 N 条，展示时翻转回升序，便于按时间线阅读
-    ordered = list(reversed(hits)) if p.get("desc") else hits
-    return head + "\n" + format_hits(env, ordered, tz, p.get("full"),
-                                     int(p.get("width", 300)), p.get("show_source"),
-                                     p.get("columns"))
+            [h.get("_source") for h in r["hits"]], ensure_ascii=False, indent=2))
+    return head + "\n" + format_hits(env, r["hits"], tz, p.get("full"), int(p.get("width", 300)),
+                                     p.get("show_source"), p.get("columns"))
+
+
+def op_search(env, p, tz, interactive=True):
+    return format_result(search_result(env, p, tz, interactive), p, tz)
+
+
+# ---------------------------------------------------------------- 跨索引追踪
+
+def follow_ids(env, hits):
+    """从链路日志中提取业务 ID（detectId 等，FOLLOW_KEYS 可配置），按出现次数排序，最多 FOLLOW_MAX_IDS 个。"""
+    keys = env.get("follow_keys") or DEFAULT_FOLLOW_KEYS
+    if isinstance(keys, str):
+        keys = [k.strip() for k in keys.split(",") if k.strip()]
+    rx = re.compile(r"[\"']?\b(%s)[\"']?\s*[:=]\s*[\"']?([\w-]{6,64})" % "|".join(re.escape(k) for k in keys))
+    counts, first = {}, {}
+    for h in hits:
+        for key, val in rx.findall(str(dig(h.get("_source", {}), env["_fields"]["message"]) or "")):
+            if val.lower() in ("null", "none", "undefined"):
+                continue
+            counts[val] = counts.get(val, 0) + 1
+            first.setdefault(val, key)
+    ranked = sorted(counts, key=lambda v: -counts[v])[:FOLLOW_MAX_IDS]
+    return [(first[v], v) for v in ranked]
+
+
+def _shift_iso(value, minutes):
+    try:
+        dt = datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    dt = min(dt + timedelta(minutes=minutes), datetime.now(timezone.utc))
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def follow_related(env, hits, p, tz, interactive=True):
+    """链路（traceId）日志 → 业务 ID → 关联索引：算法等服务不透传 traceId，只能靠 detectId 等业务 ID 串起来。
+    时间窗口取链路首条前 1 分钟到末条后 30 分钟（异步回调通常在这之内）。"""
+    related = related_indices(env, interactive)
+    if not related or not hits:
+        return []
+    ids = follow_ids(env, hits)
+    keys = env.get("follow_keys") or DEFAULT_FOLLOW_KEYS
+    if not ids:
+        return ["# —— 关联索引：链路日志中没有找到业务 ID（%s），未做跨索引追踪；可用 FOLLOW_KEYS 配置 ——"
+                % (keys if isinstance(keys, str) else ",".join(keys[:4]) + "…")]
+    stamps = sorted(t for t in (_ts(env, h) for h in hits) if t)
+    q = {"query": " OR ".join('"%s"' % v for _, v in ids), "size": FOLLOW_SHOW_ALL,
+         "since": (_shift_iso(stamps[0], -1) if stamps else None) or p.get("since") or "7d",
+         "until": (_shift_iso(stamps[-1], 30) if stamps else None) or p.get("until")}
+    label = ", ".join("%s=%s" % kv for kv in ids)
+    lines = ["# —— 关联索引（按业务 ID 跨索引追踪：%s，%s ~ %s）——" % (label, q["since"], q["until"])]
+    found = False
+    for name, pattern in related.items():
+        try:
+            renv = env_for_index(env, pattern, interactive)
+            total = _count(renv, q, tz, pattern, interactive)
+            if not total:
+                continue
+            found = True
+            if total <= FOLLOW_SHOW_ALL:
+                shown, desc = _search(renv, q, tz, pattern, interactive)[0], "全部"
+            else:
+                first = _search(renv, dict(q, size=3), tz, pattern, interactive)[0]
+                bad = _search(renv, dict(q, level="ERROR,WARN", size=30), tz, pattern, interactive)[0]
+                last = _search(renv, dict(q, size=10, desc=True), tz, pattern, interactive)[0]
+                shown = _merge_hits(env, [first, bad, last], FOLLOW_SHOW_ALL)
+                desc = "开头 %d 条、ERROR/WARN %d 条、最后 %d 条" % (len(first), len(bad), len(last))
+        except ElkError as e:
+            lines.append("# %s(%s) 检索失败：%s" % (name, pattern, str(e).splitlines()[0]))
+            continue
+        lines.append("# %s(%s) 共 %d 条，以下为%s；完整明细：elk_search index=%s query='%s' since=%s until=%s"
+                     % (name, pattern, total, desc, name, q["query"], q["since"], q["until"]))
+        lines.append(format_hits(renv, shown, tz, p.get("full"), int(p.get("width", 300)),
+                                 p.get("show_source"), p.get("columns")))
+    if not found:
+        lines.append("# 关联索引（%s）中没有这些业务 ID 的日志" % ", ".join(related))
+    return lines
+
+
+def op_trace(env, p, tz, interactive=True):
+    """按 traceId 串联链路；related 不为 off 且未指定 index 时，再按链路中的业务 ID 跨索引追踪关联索引。"""
+    r = search_result(env, p, tz, interactive)
+    out = format_result(r, p, tz)
+    if related_mode(p) == "off" or p.get("index") or p.get("json"):
+        return out
+    extra = follow_related(env, r["hits"], p, tz, interactive)
+    return "\n".join([out] + extra) if extra else out
 
 
 def agg_body(env, p, tz):
@@ -986,10 +1337,12 @@ def agg_body(env, p, tz):
 
 def op_agg(env, p, tz, interactive=True):
     check_slow_query(env, p, tz)
+    idx = index_of(env, p, interactive)
+    env = env_for_index(env, idx, interactive)
     body = agg_body(env, p, tz)
     note = None
     try:
-        res = call(env, "POST", "/%s/_search" % index_of(env, p), body, interactive=interactive)
+        res = call(env, "POST", "/%s/_search" % idx, body, interactive=interactive)
     except ElkError as e:
         field = env["_fields"].get(p.get("field") or "", p.get("field") or "")
         if getattr(e, "status", None) != 400 or not field or field.endswith(".keyword") \
@@ -997,7 +1350,7 @@ def op_agg(env, p, tz, interactive=True):
             raise
         # text 字段不能聚合：自动改用 keyword 子字段重试
         p = dict(p, field=field + ".keyword")
-        res = call(env, "POST", "/%s/_search" % index_of(env, p), agg_body(env, p, tz), interactive=interactive)
+        res = call(env, "POST", "/%s/_search" % idx, agg_body(env, p, tz), interactive=interactive)
         note = "# 注: %s 是 text 字段，已自动改用 %s.keyword" % (field, field)
         _healed("agg_text_field_keyword", field)
     lines = ["# env=%s total=%s" % (env["_name"], _total(res))]

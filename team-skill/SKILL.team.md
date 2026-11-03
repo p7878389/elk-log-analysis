@@ -39,7 +39,7 @@ description: 通过团队共享的 elk MCP 服务查询与分析 ELK（Elasticse
 | `elk_envs` | 列出环境（名称、索引、级别、代码分支、是否生产），不含凭据 |
 | `elk_fields` / `elk_indices` / `elk_ping` | 字段名与类型、索引列表、连通性 |
 | `elk_agg` | TopN（`field`）、趋势（`interval`）、趋势 + TopN |
-| `elk_search` | 日志明细：`query`(Lucene)、`level`、`service`、`host`、`logger`、`terms`、`since`/`until`、`full`、`desc` |
+| `elk_search` | 日志明细：`query`(Lucene)、`level`、`service`、`host`、`logger`、`terms`、`since`/`until`、`full`、`desc`、`related`（关联索引：auto/merge/off） |
 | `elk_trace` | 按 traceId 串联链路（正序，默认近 7 天） |
 | `elk_query_dsl` | 自定义 DSL，仅 `_search` / `_count` |
 | `code_services` | 应用名 ↔ 仓库/模块映射 |
@@ -64,7 +64,8 @@ description: 通过团队共享的 elk MCP 服务查询与分析 ELK（Elasticse
    - 量级与趋势：`elk_agg {interval:"5m", level:"ERROR", since:"3h"}`
    - Top 异常来源：`elk_agg {field:"logger_name.keyword", level:"ERROR", since:"30m"}`
 3. **看明细**：`elk_search {level:"ERROR", query:"...", size:20}`；需要堆栈时 `full:true, size:3~5`；看最新 N 条传 `desc:true`。
-4. **串链路**：从代表性错误取 traceId → `elk_trace {trace_id:"..."}`。
+4. **串链路**：从代表性错误取 traceId → `elk_trace {trace_id:"..."}`。链路之后会按日志中的 detectId 等业务 ID 到关联索引（如算法日志 `beta-algo-*`）跨索引追踪，异步调用、回调丢失这类问题看这一段。
+   - **关联索引**：与默认索引同前缀的其他索引（默认 `beta-software-*` 时自动发现 `beta-algo-*`，名称 `algo`）。按 `query`/`host`/`trace` 检索时，结果末尾的“关联索引命中”提示要跟进；默认索引无结果时会自动改查关联索引；`index:"algo"` 直接查，`related:"merge"` 合并展示，`related:"off"` 只查默认索引。关联索引没有级别/traceId 字段时，`level` 等条件自动改为在 message 中按短语匹配。
 5. **对照代码**（日志不足以下结论时必做，见第 4 节）。
 6. **输出结论**：环境与时间范围、影响量级（条数/趋势）、根因、证据（精简日志片段 + 代码位置与 commit）、修复建议。
 
@@ -96,7 +97,7 @@ description: 通过团队共享的 elk MCP 服务查询与分析 ELK（Elasticse
 
 ## 6. 常见问题
 
-- 返回为空：`elk_fields {grep:"trace"}` 核对字段名 → 放宽 `since` → 逐个去掉过滤条件。
+- 返回为空：先看结果中的关联索引提示（算法等服务的日志在 `beta-algo-*` 等关联索引里，`elk_indices` 可列出全部索引）→ `elk_fields {grep:"trace"}` 核对字段名 → 放宽 `since` → 逐个去掉过滤条件。
 - `fielddata is disabled on text fields`：agg 字段改用 `xxx.keyword`（服务端多数情况会自动重试）。
 - 工具反复报错、结果异常：调用 `elk_doctor`，把结论（FAIL/WARN）转告用户；它检查的是服务端，配置/凭据/同步问题请用户联系管理员，不要改本机配置。
 - 连不上 / 401：确认 `ELK_MCP_TOKEN` 已设置且重开过客户端，`claude mcp list` 中两项都已连接。
